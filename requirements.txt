@@ -1,0 +1,5 @@
+pandas
+pyarrow
+delta-spark
+pytest
+logging
