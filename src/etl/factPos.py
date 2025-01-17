@@ -398,9 +398,14 @@ class ETLModule_POS:
         self.log = {}
 
         if self.dev:
-            print("=====================")
-            print('Running in dev mode')
-            print("=====================")
+            print("===============================================================")
+            print(f'Running {self.FILE_NAME} in dev mode')
+            print("===============================================================")
+        else:
+            print("===============================================================")
+            print(f'Running {self.FILE_NAME}')
+            print("===============================================================")
+
 
 
     def truncate_staging(self):
@@ -614,12 +619,43 @@ class ETLModule_POS:
                 self.main_ETL()
                 print("ETL process completed successfully.")
                 self.addToFactFile(1)
+                print("========================================================================================")
             except Exception as e:
                 print(f"\t\tmain ETL process failed: {e}")
                 self.move_to_badfile()
                 self.addToFactFile(99)
+                print("========================================================================================")
             
         except Exception as e:
             print(f"Load Staging process failed: {e}")
             self.move_to_badfile()
             self.addToFactFile(2)
+            print("========================================================================================")
+
+class Mismatch_POS:
+    dev = None
+    def __init__(self, config):
+        # assert , keys in config, 'Missing keys in config'
+        self.config = config
+        self.WS_ID = config["WS_ID"]
+        self.BronzeLH_ID = config["BronzeLH_ID"]
+        self.SilverLH_ID = config["SilverLH_ID"]
+        self.CATEGORY = config["CATEGORY"]
+        self.SUBCATEGORY = config["SUBCATEGORY"]
+        self.FILE_NAME = config["FILE_NAME"]
+        self.FILE_PATH_ON_LAKE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Ingest/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{self.FILE_NAME}'
+        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.STAGING_TABLE_NAME = 'stagingPos'   + {'TRN':'Trn','PMT':'Payment','LUB':'Lube','AR_TRANSACTIONS':'AR','DSC':'Discount','EOD_METERS':'Meter','POINTS':'Points','REFUND':'Refund','EOD_TANKS':'Tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        self.FACT_TABLE_NAME    = 'factpos'      + {'TRN':'fuelsales','PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        self.MIS_TABLE_NAME     =  'mismatchpos' + {'TRN':'trn',  'PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        self.list_Processed_file = [x.name for x in notebookutils.fs.ls(f"abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/")]
+        self.path_to_fact_table = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.FACT_TABLE_NAME}'
+        self.path_to_mismatch   = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.MIS_TABLE_NAME}'
+        self.path_to_staging    = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
+        self.mismatchTable = spark.read.load(self.path_to_mismatch)
+        self.stagingTable = spark.read.load(self.path_to_staging).limit(0)
+        self.factTable = spark.read.load(self.path_to_fact_table)
+        self.FactFileHandler = FactFileHandler(self.WS_ID,self.SilverLH_ID)
+        self.dev = config.get('dev',True)
+        self.log = {}
