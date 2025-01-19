@@ -4,21 +4,49 @@ import numpy as np
 from pyspark.sql.functions import col, when, concat, lit, format_string,sum, upper, substring, expr, current_date, current_timestamp,to_timestamp,concat_ws, isnull, date_format, asc, trim, trunc, date_sub, year,coalesce, count, countDistinct, min, max
 from pyspark.sql.types import IntegerType, DecimalType, StringType, LongType, TimestampType, StructType, StructField, DoubleType, FloatType
 import pandas as pd
+from pyspark.sql import Row
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
 from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor
+from typing import Union, List, Tuple, Any
+import notebookutils
 # from tabulate import tabulate
 
 spark = SparkSession.builder\
         .appName("utils")\
         .getOrCreate()
-        
-class AuditLog:
+
+class AuditLog_Fusion:
+
+    class logger:
+        def __init__(self, **kwargs):
+            self._data = kwargs
     
-    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
+        def __getitem__(self, key):
+            return self._data[key]
+    
+        def __setitem__(self, key, value):
+            if key not in self._data:
+                raise KeyError(f"Cannot add new key: {key}")
+            self._data[key] = value
+    
+        def __delitem__(self, key):
+            raise KeyError(f"Cannot delete key: {key}")
+    
+        def __iter__(self):
+            return iter(self._data)
+    
+        def __len__(self):
+            return len(self._data)
+    
+        def __repr__(self):
+            return repr(self._data)
+    
+    def __init__(self, columns: Union[List[str], Tuple[str, ...]], WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
         '''
-        if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
+        - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
+        - if using lakehouse with Schema, please provide `schema` parameter
         '''
         self.WS_ID = WS_ID
         self.TABLE_NAME_to_check = TABLE_NAME_to_check
@@ -26,30 +54,112 @@ class AuditLog:
         self.LH_ID_to_check = LH_ID_to_check
         self.LH_ID_audit = LH_ID_audit if LH_ID_audit else LH_ID_to_check
         self.schema = schema
+        self.fixColumns = {'STARTTIME','ENDTIME','AUDITKEY','STATUS_ACTIVITY'}
+        self.columns = tuple(set(columns).union(self.fixColumns))
         
-        self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.TABLE_NAME_to_check}'
-        self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.TABLE_NAME_to_check}'
+        if self.schema:    
+            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.schema}/{self.AUDIT_TABLE_NAME}'
+            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.schema}/{self.TABLE_NAME_to_check}'
+        else:
+            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.AUDIT_TABLE_NAME}'
+            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.TABLE_NAME_to_check}'
         
-    def initialDetail(self,  pipelineName: str, pipelineId, TriggerType, TableName, functionName, ):
-        self.log = {
-            'PIPELINENAME':pipelineName, #
-            'PIPELINERUNID':pipelineId, #
-            'STARTTIME':datetime.utcnow() + timedelta(hours=7),
-            'ENDTIME':None,
-            'TRIGGERTYPE':TriggerType, #
-            'AUDITKEY':None,
-            'TABLE_NAME':TableName,
-            'STATUS_ACTIVITY':'Not start',
-            'FUNCTION_NAME':functionName,
-            'COUNTROWSBEFORE':None,
-            'COUNTROWSAFTER':None,
-            'ERRORCODE':None,
-            'ERRORMESSAGE':None
-        }
+        if not notebookutils.fs.exists(self.PATH_TO_AUDIT_TABLE):
+            raise FileExistsError(f'Create you audit table first at path abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/...')
+        if not notebookutils.fs.exists(self.PATH_TO_CHECKED_TABLE):
+            raise FileExistsError(f'your given table does not exists at path abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.TABLE_NAME_to_check}/Tables/...')
+    
+        self.log = logger(**{column: None for column in self.columns})
+        self.log['STATUS_ACTIVITY'] = 'Not start'
 
+    def setKeys(self, initConfig: dict[str, Any]):
+        assert set(initConfig.keys()).issubset(set(self.columns).difference()), f'initConfig must have the columns in {self.columns}'
+        for column in initConfig:
+            self.log[column] = initConfig[column]
 
+    def setKey(self, key: str, value: Any):
+        assert key in self.columns, f'key must be in {self.columns}'
+        self.log[key] = value
+        
+    def initialDetail(self, initConfig: dict[str, Any]):
+        self.setKeys(initConfig)
 
+    def getKey(self):
+        return self.columns
+    
+    def getLog(self):
+        return self.log
+        
+    def __str__(self):
+        out = ''
+        for key in self.columns:
+            out += f'{key}: {self.log[key]}\n'
+        return out
+    
+    def __repr__(self):
+        return str(self.log)
+    
+    def endSuccess(self):
+        self.log['STATUS_ACTIVITY'] = 'Success'
+        self._endAuditLog()
+        print(self)
 
+        
+    def endFail(self, errorCode: str, errorMessage: str):
+        self.log['STATUS_ACTIVITY'] = 'Fail'
+        self.log['ERRORCODE'] = errorCode
+        self.log['ERRORMESSAGE'] = errorMessage
+        self._endAuditLog()
+        print(self)
+
+    def _endAuditLog(self):
+        # write to audit table
+        self.log['ENDTIME'] = str(datetime.now() + timedelta(hours=7))
+        row = {}
+        for key in self.log:
+            row[key] = [str(self.log[key])]
+        data_tuples = list(zip(*row.values()))
+        df = spark.createDataFrame(data_tuples, schema=list(row.keys()))
+        df.write.mode('append').save(self.PATH_TO_AUDIT_TABLE)
+        return df
+
+    def getAuditLogTable(self):
+        return spark.read.load(self.PATH_TO_AUDIT_TABLE)
+    
+    def countBefore(self):
+        if self.log['COUNTROWSBEFORE']:
+            raise ValueError('COUNTROWSBEFORE already exist')
+        self.log['COUNTROWSBEFORE'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
+
+    def countAfter(self):
+        self.log['COUNTROWSAFTER'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
+
+    def getAllPath(self):
+        return {'PATH_TO_AUDIT_TABLE':self.PATH_TO_AUDIT_TABLE, 'PATH_TO_CHECKED_TABLE':self.PATH_TO_CHECKED_TABLE}
+
+    def startAudit(self):
+        self.log['STARTTIME'] = str(datetime.now() + timedelta(hours=7))
+        self.log['STATUS_ACTIVITY'] = 'logging ...'
+
+class AuditLog_SPC(AuditLog_Fusion):
+    
+    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
+        '''
+        - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
+        - if using lakehouse with Schema, please provide `schema` parameter
+        '''
+        super().__init__(['PIPELINENAME', 'PIPELINERUNID', 'TRIGGERTYPE', 'TABLE_NAME', 'FUNCTION_NAME','COUNTROWSBEFORE', 'COUNTROWSAFTER', 'ERRORCODE', 'ERRORMESSAGE'] ,WS_ID, TABLE_NAME_to_check, AUDIT_TABLE_NAME, LH_ID_to_check, LH_ID_audit, schema)
+
+    def initialDetail(self,  pipelineName: str, pipelineId: str, TriggerType: str, TableName: str, functionName: str):
+        super().initialDetail({
+            'PIPELINENAME': pipelineName, 
+            'PIPELINERUNID': pipelineId, 
+            'TRIGGERTYPE': TriggerType, 
+            'TABLE_NAME': TableName, 
+            'FUNCTION_NAME': functionName
+        })
+        self.startAudit()
+        self.log['AUDITKEY'] = self.log['PIPELINENAME'] + '-' + self.log['TABLE_NAME'] + '-' + str(self.log['STARTTIME']).replace(' ','_').replace(':','_')
 
 
 def fillNaAll(df):
@@ -137,185 +247,6 @@ def getSizeOnLake(tablePath):
 
     return numRow, numCol
 
-class _AuditLog:
-    '''
-    Usage:
-    (1) At first: create audit object
-            >>> audit = utils.AuditLog(MODULE_NAME='...',EXCECUTION_BY='Notebook:...', TABLE_NAME='...',ARTIFACT=...)
-            >>> audit = utils.AuditLog(MODULE_NAME='Siebel',EXCECUTION_BY='Notebook:Siebel_DimSiebelMerchandise', TABLE_NAME='SilverLH.dimsiebelmerchandise',ARTIFACT='BronzeLH_Siebel.stagingsiebelmerchandise')
-        //At first, pre-log is written at file "auditbefore.csv" to track start process (will not be deleted)
-    (2) count row before:
-            >>> audit.setRowCountBefore(table.count())
-            >>> audit.setRowCountBefore(utils.getSizeOnLake('...')[0])
-    (3) After transformation:
-            >>> audit.setRowCountAfter(utils.getSizeOnLake('....')[0])
-    (4) ending
-            >>> audit.endAuditLog()
-    '''
-    def printAsTable(self):
-        table = [(key, value) for key, value in self.log.items()]
-        for row in table:
-            print(f'{row[0]:17s}:\t{row[1]}')
-
-    def printAsTableStart(self):
-        table = [(key, value) for key, value in self.log.items() if key in ['AUDITDATE','MODULE_NAME','EXCECUTION_BY','START_TIME','TABLE_NAME']]
-        for row in table:
-            print(f'{row[0]:17s}:\t{row[1]}')
-
-    def __init__(self,MODULE_NAME,EXCECUTION_BY,TABLE_NAME,ARTIFACT=None,additional=None):
-        utc_now = datetime.utcnow() # Get the current UTC time
-        utc_plus_7 = utc_now + timedelta(hours=7) # Convert to UTC+7
-        formatted_timestamp = utc_plus_7.strftime('%Y-%m-%d %H:%M:%S') #yyyy-MM-dd HH:mm:ss # Format the timestamp
-        self.log = {}
-        self.log['AUDITDATE'] = utc_plus_7.strftime('%Y%m%d')
-        self.log['MODULE_NAME'] = MODULE_NAME
-        self.log['PACKAGE_NAME'] = None #
-        self.log['EXCECUTION_BY'] = EXCECUTION_BY
-        self.log['START_TIME'] = formatted_timestamp
-        self.log['TABLE_NAME'] = TABLE_NAME #
-        self.log['ROW_COUNT_BEFORE'] = None
-        self.log['END_TIME'] = None #
-        self.log['ROW_COUNT_AFTER'] = None # 
-        self.log['STATUS'] = 'Fail' #
-        self.log['AUDIT_KEY'] = MODULE_NAME + TABLE_NAME + utc_plus_7.strftime('%Y%m%d%H%M%S')
-        self.log['ARTIFACT'] = ARTIFACT
-
-        if additional:
-            assert isinstance(additional,dict), 'please mapper like dictionary':None,
-            for key, val in additional:
-                self.log[key]=val
-        order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'PACKAGE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT']
-        line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        with open('/lakehouse/default/Files/logfile/auditbefore.csv', 'a') as f:
-            f.write(line+'\n')
-        self.printAsTableStart()
-        
-    def add(self,key,val):
-        self.log[key] = val
-    
-    def get(self, key):
-        return self.log.get(key,None)
-
-    def setRowCountBefore(self,count):
-        self.log['ROW_COUNT_BEFORE'] = str(count)
-
-    def setRowCountAfter(self,count):
-        self.log['ROW_COUNT_AFTER'] = str(count)
-
-    def endAuditLog(self):
-        utc_now = datetime.utcnow()
-        utc_plus_7 = utc_now + timedelta(hours=7)
-        formatted_timestamp = utc_plus_7.strftime('%Y-%m-%d %H:%M:%S') #yyyy-MM-dd HH:mm:ss
-        self.log['END_TIME'] = formatted_timestamp
-        self._writeSuccess()
-        self.printAsTable()
-
-    def getAuditLog(self):
-        return self.log
-
-    def _writeFail(self):
-        self.log['STATUS'] = 'fail':None,
-        order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT', 'ROW_COUNT_BEFORE', 'END_TIME', 'ROW_COUNT_AFTER', 'STATUS']
-        line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        with open('/lakehouse/default/Files/logfile/auditlog.csv', 'a') as f:
-            f.write(line+'\n')
-
-    def _writeSuccess(self):
-        self.log['STATUS'] = 'finish':None,
-        order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT', 'ROW_COUNT_BEFORE', 'END_TIME', 'ROW_COUNT_AFTER', 'STATUS']
-        line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        with open('/lakehouse/default/Files/logfile/auditlog.csv', 'a') as f:
-            f.write(line+'\n')
-
-class AuditLog:
-    '''
-    Usage:
-    (1) At first: create audit object
-            >>> audit = utils.AuditLog(MODULE_NAME='...',EXCECUTION_BY='Notebook:...', TABLE_NAME='...',ARTIFACT=...)
-            >>> audit = utils.AuditLog(MODULE_NAME='Siebel',EXCECUTION_BY='Notebook:Siebel_DimSiebelMerchandise', TABLE_NAME='SilverLH.dimsiebelmerchandise',ARTIFACT='BronzeLH_Siebel.stagingsiebelmerchandise')
-        //At first, pre-log is written at file "auditbefore.csv" to track start process (will not be deleted)
-    (2) count row before:
-            >>> audit.setRowCountBefore(table.count())
-            >>> audit.setRowCountBefore(utils.getSizeOnLake('...')[0])
-    (3) After transformation:
-            >>> audit.setRowCountAfter(utils.getSizeOnLake('....')[0])
-    (4) ending
-            >>> audit.endAuditLog()
-    '''
-    def printAsTable(self):
-        table = [(key, value) for key, value in self.log.items()]
-        for row in table:
-            print(f'{row[0]:17s}:\t{row[1]}')
-
-    def printAsTableStart(self):
-        table = [(key, value) for key, value in self.log.items() if key in ['AUDITDATE','MODULE_NAME','EXCECUTION_BY','START_TIME','TABLE_NAME']]
-        for row in table:
-            print(f'{row[0]:17s}:\t{row[1]}')
-
-    def __init__(self,MODULE_NAME,EXCECUTION_BY,TABLE_NAME,ARTIFACT=None,additional=None):
-        utc_now = datetime.utcnow() # Get the current UTC time
-        utc_plus_7 = utc_now + timedelta(hours=7) # Convert to UTC+7
-        formatted_timestamp = utc_plus_7.strftime('%Y-%m-%d %H:%M:%S') #yyyy-MM-dd HH:mm:ss # Format the timestamp
-        self.log = {}
-        self.log['AUDITDATE'] = utc_plus_7.strftime('%Y%m%d')
-        self.log['MODULE_NAME'] = MODULE_NAME
-        self.log['PACKAGE_NAME'] = None #
-        self.log['EXCECUTION_BY'] = EXCECUTION_BY
-        self.log['START_TIME'] = formatted_timestamp
-        self.log['TABLE_NAME'] = TABLE_NAME #
-        self.log['ROW_COUNT_BEFORE'] = None
-        self.log['END_TIME'] = None #
-        self.log['ROW_COUNT_AFTER'] = None # 
-        self.log['STATUS'] = 'Fail' #
-        self.log['AUDIT_KEY'] = MODULE_NAME + TABLE_NAME + utc_plus_7.strftime('%Y%m%d%H%M%S')
-        self.log['ARTIFACT'] = ARTIFACT
-
-        if additional:
-            assert isinstance(additional,dict), 'please mapper like dictionary':None,
-            for key, val in additional:
-                self.log[key]=val
-        # order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'PACKAGE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT']
-        # line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        # with open('/lakehouse/default/Files/logfile/auditbefore.csv', 'a') as f:
-        #     f.write(line+'\n')
-        self.printAsTableStart()
-        
-    def add(self,key,val):
-        self.log[key] = val
-    
-    def get(self, key):
-        return self.log.get(key,None)
-
-    def setRowCountBefore(self,count):
-        self.log['ROW_COUNT_BEFORE'] = str(count)
-
-    def setRowCountAfter(self,count):
-        self.log['ROW_COUNT_AFTER'] = str(count)
-
-    def endAuditLog(self):
-        utc_now = datetime.utcnow()
-        utc_plus_7 = utc_now + timedelta(hours=7)
-        formatted_timestamp = utc_plus_7.strftime('%Y-%m-%d %H:%M:%S') #yyyy-MM-dd HH:mm:ss
-        self.log['END_TIME'] = formatted_timestamp
-        self._writeSuccess()
-        self.printAsTable()
-
-    def getAuditLog(self):
-        return self.log
-
-    def _writeFail(self):
-        self.log['STATUS'] = 'fail':None,
-        # order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT', 'ROW_COUNT_BEFORE', 'END_TIME', 'ROW_COUNT_AFTER', 'STATUS']
-        # line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        # with open('/lakehouse/default/Files/logfile/auditlog.csv', 'a') as f:
-        #     f.write(line+'\n')
-
-    def _writeSuccess(self):
-        self.log['STATUS'] = 'finish':None,
-        # order = ['AUDITDATE','AUDIT_KEY', 'MODULE_NAME', 'EXCECUTION_BY', 'START_TIME', 'TABLE_NAME','ARTIFACT', 'ROW_COUNT_BEFORE', 'END_TIME', 'ROW_COUNT_AFTER', 'STATUS']
-        # line = ','.join([self.log[key] if self.log[key] else '' for key in order])
-        # with open('/lakehouse/default/Files/logfile/auditlog.csv', 'a') as f:
-        #     f.write(line+'\n')
 
 def savetable(df, sinkPath='UATQueryResult.onFabric'):
     df.select(['index','Table','Column','KeyCheck','KeyGroupby','groupbyValue','valueOnFabric','dateCheck',]).withColumn('valueOnFabric', col('valueOnFabric').cast(FloatType())).write.mode('append').saveAsTable(sinkPath)
@@ -450,7 +381,6 @@ def runQuerySpark_byRow(df,idx, Table, Column, KeyCheck, groupbyKey, cTime, addi
         result = result.withColumn('groupbyValue', date_format(col("groupbyValue").cast(TimestampType()), 'yyyyMMdd'))
 
     return result
-
 
 def runQuerySpark_TableName(TableName, referenceTable,LakehouseName='SilverLH', sinkPath='UATQueryResult.onFabric', saveResult=True):
     referenceTable_filter = referenceTable[referenceTable['Table'].apply(lambda x: x.lower())==TableName.lower()]
