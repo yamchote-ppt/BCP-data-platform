@@ -1,14 +1,9 @@
 # Welcome to your new notebook
 # Type here in the cell editor to add code!
-import numpy as np
-from pyspark.sql.functions import col, when, concat, lit, format_string,sum, upper, substring, expr, current_date, current_timestamp,to_timestamp,concat_ws, isnull, date_format, asc, trim, trunc, date_sub, year,coalesce, count, countDistinct, min, max
+from pyspark.sql.functions import col
 from pyspark.sql.types import IntegerType, DecimalType, StringType, LongType, TimestampType, StructType, StructField, DoubleType, FloatType
-import pandas as pd
-from pyspark.sql import Row
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
-from tqdm.auto import tqdm
-from concurrent.futures import ThreadPoolExecutor
 from typing import Union, List, Tuple, Any
 import notebookutils
 # from tabulate import tabulate
@@ -65,11 +60,11 @@ class AuditLog_Fusion:
             self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.TABLE_NAME_to_check}'
         
         if not notebookutils.fs.exists(self.PATH_TO_AUDIT_TABLE):
-            raise FileExistsError(f'Create you audit table first at path abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/...')
+            raise FileExistsError(f'Create you audit table first at path {self.PATH_TO_AUDIT_TABLE}')
         if not notebookutils.fs.exists(self.PATH_TO_CHECKED_TABLE):
-            raise FileExistsError(f'your given table does not exists at path abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.TABLE_NAME_to_check}/Tables/...')
+            raise FileExistsError(f'your given table does not exists at path {self.PATH_TO_CHECKED_TABLE}')
     
-        self.log = logger(**{column: None for column in self.columns})
+        self.log = self.logger(**{column: None for column in self.columns})
         self.log['STATUS_ACTIVITY'] = 'Not start'
 
     def setKeys(self, initConfig: dict[str, Any]):
@@ -141,7 +136,10 @@ class AuditLog_Fusion:
         self.log['STARTTIME'] = str(datetime.now() + timedelta(hours=7))
         self.log['STATUS_ACTIVITY'] = 'logging ...'
 
-class AuditLog_SPC(AuditLog_Fusion):
+    def execute(self,ETL_func):
+        raise NotImplementedError('This method must be implemented in the child class')
+
+class AuditLog_BCP(AuditLog_Fusion):
     
     def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
         '''
@@ -161,6 +159,15 @@ class AuditLog_SPC(AuditLog_Fusion):
         self.startAudit()
         self.log['AUDITKEY'] = self.log['PIPELINENAME'] + '-' + self.log['TABLE_NAME'] + '-' + str(self.log['STARTTIME']).replace(' ','_').replace(':','_')
 
+    def execute(self, ETL_func):
+        try:
+            self.countBefore()
+            ETL_func()
+            self.countAfter()
+            self.endSuccess()
+        except Exception as e:
+            self.endFail(errorCode = '-', errorMessage = e)
+        
 
 def fillNaAll(df):
     fillnaDefault = {
@@ -246,201 +253,6 @@ def getSizeOnLake(tablePath):
     """).count()
 
     return numRow, numCol
-
-
-def savetable(df, sinkPath='UATQueryResult.onFabric'):
-    df.select(['index','Table','Column','KeyCheck','KeyGroupby','groupbyValue','valueOnFabric','dateCheck',]).withColumn('valueOnFabric', col('valueOnFabric').cast(FloatType())).write.mode('append').saveAsTable(sinkPath)
-
-def runQuerySpark_byRow(df,idx, Table, Column, KeyCheck, groupbyKey, cTime, additionalSQLFilter = None):
-    # Start with the base DataFrame
-    if additionalSQLFilter:
-        df = df.filter(expr(additionalSQLFilter))
-    else:
-        additionalSQLFilter = ''
-
-    if KeyCheck == 'countrow':
-        result = df.selectExpr("cast(count(*) AS FLOAT) AS valueOnFabric")\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(groupbyKey))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'countby':
-        result = df.groupBy(groupbyKey)\
-                    .agg(count('*').alias('valueOnFabric'))\
-                    .withColumn("index", lit(idx))\
-                    .withColumn("Table", lit(Table))\
-                    .withColumn("Column", lit(Column))\
-                    .withColumn("KeyCheck", lit(KeyCheck))\
-                    .withColumn("KeyGroupby", lit(groupbyKey))\
-                    .withColumn("groupbyValue", col(groupbyKey).cast("string"))\
-                    .withColumn('dateCheck',lit(cTime))\
-                    .drop(groupbyKey)\
-                    .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'countdistinctby':
-        result = df.groupBy(groupbyKey)\
-                    .agg(countDistinct(Column).alias('valueOnFabric'))\
-                    .withColumn("index", lit(idx))\
-                    .withColumn("Table", lit(Table))\
-                    .withColumn("Column", lit(Column))\
-                    .withColumn("KeyCheck", lit(KeyCheck))\
-                    .withColumn("KeyGroupby", lit(groupbyKey))\
-                    .withColumn("groupbyValue", col(groupbyKey).cast("string"))\
-                    .withColumn('dateCheck',lit(cTime))\
-                    .drop(groupbyKey)\
-                    .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'distinct':
-        result = df.agg(countDistinct(Column).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(groupbyKey))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'countnonnull':
-        result = df.filter(col(Column).isNotNull()).agg(count('*').alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'firstdate':
-        result = df.filter(col(Column).isNotNull()).agg(min(date_format(Column, 'yyyyMMdd')).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'lastdate':
-        result = df.filter(col(Column).isNotNull()).agg(max(date_format(Column, 'yyyyMMdd')).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'max':
-        result = df.filter(col(Column).isNotNull()).agg(max(Column).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'min':
-        result = df.filter(col(Column).isNotNull()).agg(min(Column).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'sum':
-        result = df.agg(sum(Column).alias('valueOnFabric'))\
-                   .withColumn("index", lit(idx))\
-                   .withColumn("Table", lit(Table))\
-                   .withColumn("Column", lit(Column))\
-                   .withColumn("KeyCheck", lit(KeyCheck))\
-                   .withColumn("KeyGroupby", lit(''))\
-                   .withColumn("groupbyValue", lit(''))\
-                   .withColumn('dateCheck', lit(cTime))\
-                   .withColumn('filter', lit(additionalSQLFilter))
-    elif KeyCheck == 'sumby':
-        result = df.groupBy(groupbyKey)\
-                    .agg(sum(Column).alias('valueOnFabric'))\
-                    .withColumn("index", lit(idx))\
-                    .withColumn("Table", lit(Table))\
-                    .withColumn("Column", lit(Column))\
-                    .withColumn("KeyCheck", lit(KeyCheck))\
-                    .withColumn("KeyGroupby", lit(groupbyKey))\
-                    .withColumn("groupbyValue", col(groupbyKey).cast("string"))\
-                    .withColumn('dateCheck',lit(cTime))\
-                    .drop(groupbyKey)\
-                    .withColumn('filter', lit(additionalSQLFilter))
-
-    #special exception
-    # print(groupbyKey)
-    if groupbyKey.lower() == 'saledate':
-        result = result.withColumn('groupbyValue', date_format(col("groupbyValue").cast(TimestampType()), 'yyyyMMdd'))
-
-    return result
-
-def runQuerySpark_TableName(TableName, referenceTable,LakehouseName='SilverLH', sinkPath='UATQueryResult.onFabric', saveResult=True):
-    referenceTable_filter = referenceTable[referenceTable['Table'].apply(lambda x: x.lower())==TableName.lower()]
-    df = spark.table(LakehouseName+'.'+TableName)
-
-    results = []
-
-    for rowIdx in tqdm(referenceTable_filter.index, desc=TableName,leave=True):
-        resultRow = runQuerySpark_byRow(df,*referenceTable_filter.loc[rowIdx])
-        results.append(resultRow)
-    
-    result = results[0]
-    for r in results[1:]:
-        result = result.unionByName(r)
-    
-    if saveResult:
-        savetable(result,sinkPath)
-
-    return result
-
-def runQuerySpark(referenceTable,LakehouseName='SilverLH', sinkPath='UATQueryResult.onFabric', saveResult=True,max_workers=4):
-
-    allTable = referenceTable['Table'].unique()
-    numtable = len(allTable)
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as p:
-        results = list(p.map(runQuerySpark_TableName,allTable,[referenceTable]*numtable,[LakehouseName]*numtable,[sinkPath]*numtable,[saveResult]*numtable))
-    
-    result = results[0]
-    for r in results[1:]:
-        result = result.unionByName(r)
-    return result.withColumn('valueOnFabric',col('valueOnFabric').cast(FloatType()))
-    
-class TrackSize:
-    def __init__(self):
-        # self.WS_ID = WS_ID
-        # self.LH_ID = LH_ID
-        self.dictTrack = {}
-        self.step = 1
-    
-    def log(self,tableName,size):
-        tableName = tableName.lower()
-        if tableName not in self.dictTrack.keys():
-            self.dictTrack[tableName] = {str(self.step):size}
-        else:
-            self.dictTrack[tableName][str(self.step)]=size
-        self.step += 1
-
-    def __str__(self):
-        # Create a string representation of the dictionary keys
-        output = []
-        for key in self.dictTrack:
-            output.append(f"{key}: {self.dictTrack[key]}")
-        return "{\n"+"\t\n".join(output)+"\n}"
-
-
-
-
-
 
 
 
