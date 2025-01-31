@@ -139,16 +139,14 @@ class AuditLog_Fusion:
     def execute(self,ETL_func):
         raise NotImplementedError('This method must be implemented in the child class')
 
-class AuditLog_BCP(AuditLog_Fusion):
+class AuditLog_Project(AuditLog_Fusion):
     
-    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
+    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, pipelineName: str, pipelineId: str, TriggerType: str, TableName: str, functionName: str, LH_ID_audit: str = None, schema: str = None):
         '''
         - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
         - if using lakehouse with Schema, please provide `schema` parameter
         '''
         super().__init__(['PIPELINENAME', 'PIPELINERUNID', 'TRIGGERTYPE', 'TABLE_NAME', 'FUNCTION_NAME','COUNTROWSBEFORE', 'COUNTROWSAFTER', 'ERRORCODE', 'ERRORMESSAGE'] ,WS_ID, TABLE_NAME_to_check, AUDIT_TABLE_NAME, LH_ID_to_check, LH_ID_audit, schema)
-
-    def initialDetail(self,  pipelineName: str, pipelineId: str, TriggerType: str, TableName: str, functionName: str):
         super().initialDetail({
             'PIPELINENAME': pipelineName, 
             'PIPELINERUNID': pipelineId, 
@@ -157,7 +155,7 @@ class AuditLog_BCP(AuditLog_Fusion):
             'FUNCTION_NAME': functionName
         })
         self.startAudit()
-        self.log['AUDITKEY'] = self.log['PIPELINENAME'] + '-' + self.log['TABLE_NAME'] + '-' + str(self.log['STARTTIME']).replace(' ','_').replace(':','_')
+        self.log['AUDITKEY'] = self.log['PIPELINENAME'] + '-' + self.log['TABLE_NAME'] + '-' + str(self.log['STARTTIME']).replace(' ','_').replace(':','_')    
 
     def execute(self, ETL_func):
         try:

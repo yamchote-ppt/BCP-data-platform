@@ -2,7 +2,7 @@
 # Type here in the cell editor to add code!
 import numpy as np
 from pyspark.sql import Row
-from pyspark.sql.functions import col, when, concat, lit, format_string, upper, substring, substring_index, expr, current_date, current_timestamp, length, to_timestamp,concat_ws, isnull, date_format, asc, trim, trunc, date_sub, year,coalesce, row_number, sum, lpad, max, regexp_replace, floor
+from pyspark.sql.functions import col, when, concat, lit, format_string, upper, substring, substring_index, expr, current_date, current_timestamp, length, to_timestamp,concat_ws, isnull, date_format, asc, trim, trunc, date_sub, year,coalesce, row_number, sum, lpad, max, regexp_replace, floor, instr
 from pyspark.sql.types import IntegerType, DecimalType, StringType, LongType, TimestampType, StructType, StructField, DoubleType, ShortType
 import pandas as pd
 import re
@@ -23,6 +23,17 @@ spark = SparkSession.builder.config("spark.sql.extensions", "delta.sql.DeltaSpar
 
 factFile = spark.sql("SELECT * FROM SilverLH.factfile LIMIT 0")
 current_date = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
+
+def get_all_files(directory):
+    file_paths = []
+    for root, dirs, files in os.walk(directory):
+        if ('Archive' not in root):
+            for file in files:
+                if (re.match(r'.*\.[a-zA-Z]+$',file)):
+                    matchObj = re.match(r'^.*/POS/(FIRSTPRO|FLOWCO)/([A-Z_]*)$', root)
+                    # file_paths.append(os.path.join(root, file))
+                    file_paths.append((matchObj.group(1),matchObj.group(2), file))
+    return file_paths
 
 class LoadToFact:
     def __init__(self, path_to_fact_table, path_to_mismatch, stagingTable, CATEGORY, SUBCATEGORY,WS_ID,SilverLH_ID, factTable,mismatchTable):
@@ -48,6 +59,69 @@ class LoadToFact:
         self.stagingTable = self.stagingTable.withColumns(
             {column: ColumnsExpr[column] for column in ColumnsExpr}
         )
+
+    def lookUpStation(self, incomingDF, POSName_key, POSCode_key, CustomerCode_key):
+        print('\t\t\t\t\tStarting Lookup Station...')
+        incomingDF = incomingDF.withColumns({'key1':col(POSName_key),'key2':col(POSCode_key),'key3':col(CustomerCode_key)})
+        dimstationjoin = self.dimStation.withColumnsRenamed({'POSName':'key1','POSCode':'key2','CustomerCode':'key3'})
+        lookupCondition = ['key1','key2','key3']
+
+        matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2','key3')
+        UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2','key3').withColumn('StationKey',lit(None).cast(IntegerType()))
+        assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
+        print('\t\t\t\t\tLookup Station completed')
+        return matchStation, UnMatchStation
+    
+    def lookUpProduct(self, incomingDF, SourceKey_key, SourceTitle_key, StationKey_key,mappingProduct, mappingProductNoTitle):
+        print('\t\t\t\t\tStarting Lookup Product...')
+        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(SourceTitle_key),'key3':col(StationKey_key)})
+        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'})
+        mappingProductNoTitlejoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key3'})
+        lookupCondition = ['key1','key2']
+        # mappingProduct.select('CustomerCode')
+        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2','key3')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti')
+
+        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
+
+        #lookup mappingKey
+        lookUpConditionNoTitle = ['key1','key3']
+        matchProductNoTitle = UnMatchProduct.join(mappingProductNoTitlejoin, on=lookUpConditionNoTitle, how='inner').drop('key1','key2','key3')
+        UnMatchProductNoTitle = UnMatchProduct.join(mappingProductNoTitlejoin, on=lookUpConditionNoTitle, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2','key3')
+        assert UnMatchProduct.count() == matchProductNoTitle.count() + UnMatchProductNoTitle.count(), 'Error in lookup mappingProduct: UnMatchProduct.count() != matchProductNoTitle.count() + UnMatchProductNoTitle.count()'
+        matchTable = matchProduct.unionByName(matchProductNoTitle)
+        print('\t\t\t\t\tLookup Product completed')
+        return matchTable, UnMatchProductNoTitle
+    
+    def lookUpStation_FLOWCO_TANKS(self, incomingDF, POSCode_key, CustomerCode_key):
+        print('\t\t\t\t\tStarting Lookup Station...')
+        tmpDimstation = self.dimStation.select('StationKey','CustomerCode','POSCode')
+        incomingDF = incomingDF.withColumns({'key1':col('POSCode'),'key2':col('CustomerCode')})
+        dimstationjoin = tmpDimstation.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
+        lookupCondition = ['key1','key2']
+
+        matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2')
+        UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2').withColumn('StationKey',lit(None).cast(IntegerType()))
+        assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
+        print('\t\t\t\t\tLookup Station completed')
+        return matchStation, UnMatchStation
+    
+    def lookUpProduct_FLOWCO_TANKS(self, incomingDF, mappingProduct):
+        print('\t\t\t\t\tStarting Lookup Product...')
+
+        incomingDF = incomingDF.withColumns({'key1':col('GradeNumber')})
+        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1'}).drop_duplicates()
+        lookupCondition = ['key1']
+        matchTable = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1')
+        # assert incomingDF.count() == matchTable.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct'
+
+        UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0)) 
+        return matchTable, UnMatchProduct
+
+class LoadToFact_main(LoadToFact):
+    def __init__(self, path_to_fact_table, path_to_mismatch, stagingTable, CATEGORY, SUBCATEGORY,WS_ID,SilverLH_ID, factTable,mismatchTable):
+        super().__init__(path_to_fact_table, path_to_mismatch, stagingTable, CATEGORY, SUBCATEGORY,WS_ID,SilverLH_ID, factTable,mismatchTable)
 
     def step1(self):
         print('\t\t\t\tstep1 process...')
@@ -128,89 +202,33 @@ class LoadToFact:
             self.dataConversion({'GradeNumber': StringType})
         print('\t\t\t\tstep1 processed completed')
 
-    def lookUpStation_FIRSTPRO(self, incomingDF, POSName_key, POSCode_key, CustomerCode_key):
-        print('\t\t\t\t\tStarting Lookup Station...')
-        incomingDF = incomingDF.withColumns({'key1':col(POSName_key),'key2':col(POSCode_key),'key3':col(CustomerCode_key)})
-        dimstationjoin = self.dimStation.withColumnsRenamed({'POSName':'key1','POSCode':'key2','CustomerCode':'key3'})
-        lookupCondition = ['key1','key2','key3']
-
-        matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2','key3')
-        UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2','key3').withColumn('StationKey',lit(None).cast(IntegerType()))
-        assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
-        print('\t\t\t\t\tLookup Station completed')
-        return matchStation, UnMatchStation
-    
-    def lookUpStation_FLOWCO_TANKS(self, incomingDF, POSCode_key, CustomerCode_key):
-        print('\t\t\t\t\tStarting Lookup Station...')
-        tmpDimstation = self.dimStation.select('StationKey','CustomerCode','POSCode')
-        incomingDF = incomingDF.withColumns({'key1':col('POSCode'),'key2':col('CustomerCode')})
-        dimstationjoin = tmpDimstation.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
-        lookupCondition = ['key1','key2']
-
-        matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2')
-        UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2').withColumn('StationKey',lit(None).cast(IntegerType()))
-        assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
-        print('\t\t\t\t\tLookup Station completed')
-        return matchStation, UnMatchStation
-    
-    def lookUpProduct_FIRSTPRO(self, incomingDF, SourceKey_key, SourceTitle_key, StationKey_key,mappingProduct, mappingProductNoTitle):
-        print('\t\t\t\t\tStarting Lookup Product...')
-        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(SourceTitle_key),'key3':col(StationKey_key)})
-        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'})
-        mappingProductNoTitlejoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key3'})
-        lookupCondition = ['key1','key2']
-        # mappingProduct.select('CustomerCode')
-        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2','key3')
-        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti')
-
-        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
-
-        #lookup mappingKey
-        lookUpConditionNoTitle = ['key1','key3']
-        matchProductNoTitle = UnMatchProduct.join(mappingProductNoTitlejoin, on=lookUpConditionNoTitle, how='inner').drop('key1','key2','key3')
-        UnMatchProductNoTitle = UnMatchProduct.join(mappingProductNoTitlejoin, on=lookUpConditionNoTitle, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2','key3')
-        assert UnMatchProduct.count() == matchProductNoTitle.count() + UnMatchProductNoTitle.count(), 'Error in lookup mappingProduct: UnMatchProduct.count() != matchProductNoTitle.count() + UnMatchProductNoTitle.count()'
-        matchTable = matchProduct.unionByName(matchProductNoTitle)
-        print('\t\t\t\t\tLookup Product completed')
-        return matchTable, UnMatchProductNoTitle
-    
-    def lookUpProduct_FLOWCO_TANKS(self, incomingDF, mappingProduct):
-        print('\t\t\t\t\tStarting Lookup Product...')
-
-        incomingDF = incomingDF.withColumns({'key1':col('GradeNumber')})
-        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1'}).drop_duplicates()
-        lookupCondition = ['key1']
-        matchTable = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1')
-        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1')
-        # assert incomingDF.count() == matchTable.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct'
-
-        UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0)) 
-        return matchTable, UnMatchProduct
-    
     def lookUp(self):
         print('\t\t\t\tStarting Lookup process...')
+        mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
+        mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
+
         if self.CATEGORY.upper() == 'FIRSTPRO' and self.SUBCATEGORY.upper() in ['REFUND', 'POINTS']:
-            matchFinal, UnMatchFinal = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
         elif self.SUBCATEGORY.upper() == 'PMT':
-            matchFinal, UnMatchFinal = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
             if self.CATEGORY.upper() == 'FIRSTPRO':
                 matchFinal = matchFinal.withColumn('PAY_Time',col('PayTimeKey')).drop('PayTimeKey').withColumn('END_Time',col('END_TimeKey')).drop('END_TimeKey')
 
         elif self.SUBCATEGORY.upper() in ['DSC', 'LUB']:
-            matchFinal, UnMatchFinal = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
         
         elif self.SUBCATEGORY.upper() == 'TRN':
-            matchStation, UnMatchStation = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
             elif self.CATEGORY.upper() == 'FLOWCO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
 
-            matchFinal, UnMatchProduct = self.lookUpProduct_FIRSTPRO(matchStation, SourceKey_key='Grade', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
+            matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='Grade', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct)
 
             if self.CATEGORY.upper() == 'FIRSTPRO':
@@ -224,45 +242,40 @@ class LoadToFact:
             matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'}).withColumn('Vat',lit(None))
 
         elif self.SUBCATEGORY.upper() == 'EOD_METERS':
-            matchStation, UnMatchStation = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS') & (col('sourcetitle').isNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS') & (col('sourcetitle').isNull()))
 
             elif self.CATEGORY.upper() == 'FLOWCO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS') & (col('StationKey').isNotNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS') & (col('StationKey').isNotNull()))
 
-            matchFinal, UnMatchProduct = self.lookUpProduct_FIRSTPRO(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
+            matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct) #.withColumn('GradeNumber',col('GradeNumber').cast(ShortType()))
             matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'})
         
         elif self.SUBCATEGORY.upper() == 'AR_TRANSACTIONS':
-            matchStation, UnMatchStation = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'AR')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'AR'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
             elif self.CATEGORY.upper() == 'FLOWCO':
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'AR')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull())).drop_duplicates()
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'AR'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
             
-            matchFinal, UnMatchProduct = self.lookUpProduct_FIRSTPRO(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
-            UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct)
-            matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'GradeKey','LBAmount':'LubeAmount','AttendantNumber':'AttendeeNumber'})
-        
-
-            matchFinal, UnMatchProduct = self.lookUpProduct_FIRSTPRO(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
+            matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct)
             matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'GradeKey','LBAmount':'LubeAmount','AttendantNumber':'AttendeeNumber'})
 
         elif self.SUBCATEGORY.upper() == 'EOD_TANKS':
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                matchStation, UnMatchStation = self.lookUpStation_FIRSTPRO(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+                matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS')).drop_duplicates()
-                mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull())).drop_duplicates()
-                matchFinal, UnMatchProduct = self.lookUpProduct_FIRSTPRO(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
+                mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS'))
+                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull()))
+                matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
                 UnMatchProduct = UnMatchProduct.filter((col('GradeNumber') == 2) & (col('OpenVolume') == 0) & (col('CloseVolume') == 0) & (col('DeliveryVolume') == 0))
 
                 UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct).drop('ReStationName')
@@ -271,7 +284,7 @@ class LoadToFact:
             elif self.CATEGORY.upper() == 'FLOWCO':
                 matchStation, UnMatchStation = self.lookUpStation_FLOWCO_TANKS(self.stagingTable, POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION')).drop_duplicates()
+                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('MappingKey')).filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION'))
                 matchFinal, UnMatchProduct = self.lookUpProduct_FLOWCO_TANKS(matchStation, mappingProduct=mappingProduct)
                 self.log['UnMatchStation'] = UnMatchStation
                 self.log['UnMatchProduct'] = UnMatchProduct
@@ -283,12 +296,10 @@ class LoadToFact:
             print(f'Waited to implement lookUp for {self.CATEGORY} and {self.SUBCATEGORY}')
 
         UnMatchFinal = UnMatchFinal.select(spark.read.load(self.path_to_mismatch).limit(0).columns)
-        self.log['UnMatchFinal'] = UnMatchFinal
         UnMatchFinal = utils.copySchemaByName(UnMatchFinal, self.mismatchTable)
         UnMatchFinal.write.mode('append').save(self.path_to_mismatch)
         print('\t\t\t\t\tUnMatchFinal.count() = ',UnMatchFinal.count(), 'is added to mismatchTable')
         
-        self.log['matchFinal'] = matchFinal
         matchFinal = matchFinal.select(spark.read.load(self.path_to_fact_table).limit(0).columns)
         matchFinal = utils.copySchemaByName(matchFinal, self.factTable)
         matchFinal.write.mode('append').save(self.path_to_fact_table)
@@ -304,6 +315,169 @@ class LoadToFact:
         step2: lookup
         '''
         try:
+            self.step1()
+            self.lookUp()
+
+        except Exception as e:
+            print(f"Error in run load_to_fact: {e}")
+
+class LoadToFact_mismatch(LoadToFact):  
+    def __init__(self, path_to_fact_table, path_to_mismatch, stagingTable, CATEGORY, SUBCATEGORY,WS_ID,SilverLH_ID, factTable,mismatchTable):
+        super().__init__(path_to_fact_table, path_to_mismatch, stagingTable, CATEGORY, SUBCATEGORY,WS_ID,SilverLH_ID, factTable,mismatchTable)
+    
+    def addFileNameToStagingTable(self):
+        self.stagingTable = self.stagingTable.join(factFile.select('FileKey','FileName'), on='FileKey', how='left')
+
+    def step1(self):
+        print('\t\t\t\tstep1 process...')
+        if self.SUBCATEGORY.upper() == 'EOD_TANKS':
+            pass
+        elif self.SUBCATEGORY.upper() == 'EOD_METERS':
+            self.dataConversion({'GradeNumber': StringType})
+            self.derivedField({
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        elif self.SUBCATEGORY.upper() == 'TRN':
+            pass
+        elif self.SUBCATEGORY.upper() == 'PMT':
+            self.derivedField({
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        elif self.SUBCATEGORY.upper() == 'LUB':
+            self.derivedField({
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        elif self.SUBCATEGORY.upper() == 'AR_TRANSACTIONS':
+            self.dataConversion({'GradeNumber': StringType})
+            self.derivedField({
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'CastLubeCode': when(col('LubeCode') == "", "0").otherwise(col('LubeCode')),
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+                'ReGradeTitle': when((col('GradeTitle') == "") & (col('Volume') == 0) & (col('Amount') == 0), "LUBE").otherwise(col('GradeTitle'))
+            })
+        elif self.SUBCATEGORY.upper() == 'DSC':
+            self.derivedField({
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        elif self.SUBCATEGORY.upper() == 'POINTS':
+            pass
+        elif self.SUBCATEGORY.upper() == 'REFUND':
+            self.derivedField({
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        elif self.SUBCATEGORY.upper() == 'EOD_TANKS':
+            self.dataConversion({'GradeNumber': StringType})
+            self.derivedField({
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+
+        print('\t\t\t\tstep1 processed completed')
+
+    def lookUp(self):
+        print('\t\t\t\tStarting Lookup process...')
+        mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
+        mappingProductNoTitle = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
+
+        if self.SUBCATEGORY.upper() == 'POINTS':
+            pass
+        elif self.SUBCATEGORY.upper() == 'REFUND':
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+        elif self.SUBCATEGORY.upper() == 'PMT':
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+        elif self.SUBCATEGORY.upper() == 'DSC':
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+        elif self.SUBCATEGORY.upper() == 'LUB':
+            matchFinal, UnMatchFinal = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+        elif self.SUBCATEGORY.upper() == 'TRN':
+            pass
+        elif self.SUBCATEGORY.upper() == 'EOD_METERS':
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            
+            # FirstPro
+            matchStation_FirstPro = matchStation.filter(~col('IsFlowCo'))
+            mappingProduct_FirstPro = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS'))
+            mappingProductNoTitle_FirstPro = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS') & (col('StationKey').isNotNull()))
+            matchFinal_FirstPro, UnMatchProduct_FirstPro = self.lookUpProduct(matchStation_FirstPro, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FirstPro, mappingProductNoTitle=mappingProductNoTitle_FirstPro)
+
+            # FlowCo
+            matchStation_FlowCo   = matchStation.filter(col('IsFlowCo'))
+            mappingProduct_FlowCo = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS'))
+            mappingProductNoTitle_FlowCo = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS') & (col('StationKey').isNotNull()))
+            matchFinal_FlowCo, UnMatchProduct_FlowCo = self.lookUpProduct(matchStation_FlowCo, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FlowCo, mappingProductNoTitle=mappingProductNoTitle_FlowCo)
+
+            matchFinal = matchFinal_FirstPro.unionByName(matchFinal_FlowCo)
+            matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'})
+
+            UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct_FirstPro).unionByName(UnMatchProduct_FlowCo)
+        elif self.SUBCATEGORY.upper() == 'AR_TRANSACTIONS':
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            
+            # FirstPro
+            matchStation_FirstPro = matchStation.filter(~col('IsFlowCo'))
+            mappingProduct_FirstPro = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'AR'))
+            mappingProductNoTitle_FirstPro = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
+            matchFinal_FirstPro, UnMatchProduct_FirstPro = self.lookUpProduct(matchStation_FirstPro, SourceKey_key='GradeNumber', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FirstPro, mappingProductNoTitle=mappingProductNoTitle_FirstPro)
+
+            # FlowCo
+            matchStation_FlowCo   = matchStation.filter(col('IsFlowCo'))
+            mappingProduct_FlowCo = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'AR'))
+            mappingProductNoTitle_FlowCo = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()))
+            matchFinal_FlowCo, UnMatchProduct_FlowCo = self.lookUpProduct(matchStation_FlowCo, SourceKey_key='GradeNumber', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FlowCo, mappingProductNoTitle=mappingProductNoTitle_FlowCo)
+
+            matchFinal = matchFinal_FirstPro.unionByName(matchFinal_FlowCo)
+            matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'GradeKey','LBAmount':'LubeAmount','AttendantNumber':'AttendeeNumber'})
+
+            UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct_FirstPro).unionByName(UnMatchProduct_FlowCo)
+        elif self.SUBCATEGORY.upper() == 'EOD_TANKS':
+            matchStation, UnMatchStation = self.lookUpStation(self.stagingTable, POSName_key='ReStationName', POSCode_key='POSCode', CustomerCode_key='CustomerCode')
+            
+            # FirstPro
+            matchStation_FirstPro = matchStation.filter(~col('IsFlowCo'))
+            mappingProduct_FirstPro = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS'))
+            mappingProductNoTitle_FirstPro = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull()))
+            matchFinal_FirstPro, UnMatchProduct_FirstPro = self.lookUpProduct(matchStation_FirstPro, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FirstPro, mappingProductNoTitle=mappingProductNoTitle_FirstPro)
+
+            # FlowCo
+            matchStation_FlowCo   = matchStation.filter(col('IsFlowCo'))
+            mappingProduct_FlowCo = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TANKS'))
+            mappingProductNoTitle_FlowCo = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull()))
+            matchFinal_FlowCo, UnMatchProduct_FlowCo = self.lookUpProduct(matchStation_FlowCo, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct_FlowCo, mappingProductNoTitle=mappingProductNoTitle_FlowCo)
+
+            matchFinal = matchFinal_FirstPro.unionByName(matchFinal_FlowCo).withColumnsRenamed({'MappingKey':'ProductKey'})
+            UnMatchFinal = UnMatchProduct_FlowCo.unionByName(UnMatchProduct_FirstPro).filter((col('GradeNumber') == 2) & (col('OpenVolume') == 0) & (col('CloseVolume') == 0) & (col('DeliveryVolume') == 0)).unionByName(UnMatchStation)
+        else:
+            print(f'Waited to implement lookUp for {self.CATEGORY} and {self.SUBCATEGORY}')
+
+        UnMatchFinal = UnMatchFinal.select(spark.read.load(self.path_to_mismatch).limit(0).columns)
+        UnMatchFinal = utils.copySchemaByName(UnMatchFinal, self.mismatchTable)
+        UnMatchFinal.write.mode('overwrite').save(self.path_to_mismatch)
+        print('\t\t\t\t\tUnMatchFinal.count() = ',UnMatchFinal.count(), 'is added to mismatchTable')
+        
+        matchFinal = matchFinal.select(spark.read.load(self.path_to_fact_table).limit(0).columns)
+        matchFinal = utils.copySchemaByName(matchFinal, self.factTable)
+        matchFinal.write.mode('append').save(self.path_to_fact_table)
+        print('\t\t\t\t\tmatchFinal.count() = ',matchFinal.count(), 'is added to factTable')
+
+        print('\t\t\t\tLookup process completed')
+
+    def run(self):
+        print('\t\t\tStarting Load to Fact... by loadtofactObj.run()')
+        '''
+        run ther following steps:
+        step1: 
+        step2: 
+        '''
+        try:
+            self.addFileNameToStagingTable()
             self.step1()
             self.lookUp()
 
@@ -368,8 +542,8 @@ class FactFileHandler:
         self.new_record['CategoryName'] = CategoryName
         self.new_record['SubCategoryName'] = SubCategoryName
         self.new_record['LoadStatus'] = LoadStatus
-    
-class ETLModule_POS:
+
+class POS:
     dev = None
     def __init__(self, config):
         # assert , keys in config, 'Missing keys in config'
@@ -379,14 +553,9 @@ class ETLModule_POS:
         self.SilverLH_ID = config["SilverLH_ID"]
         self.CATEGORY = config["CATEGORY"]
         self.SUBCATEGORY = config["SUBCATEGORY"]
-        self.FILE_NAME = config["FILE_NAME"]
-        self.FILE_PATH_ON_LAKE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Ingest/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{self.FILE_NAME}'
-        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
-        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
         self.STAGING_TABLE_NAME = 'stagingPos'   + {'TRN':'Trn','PMT':'Payment','LUB':'Lube','AR_TRANSACTIONS':'AR','DSC':'Discount','EOD_METERS':'Meter','POINTS':'Points','REFUND':'Refund','EOD_TANKS':'Tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
         self.FACT_TABLE_NAME    = 'factpos'      + {'TRN':'fuelsales','PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
         self.MIS_TABLE_NAME     =  'mismatchpos' + {'TRN':'trn',  'PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.list_Processed_file = [x.name for x in notebookutils.fs.ls(f"abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/")]
         self.path_to_fact_table = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.FACT_TABLE_NAME}'
         self.path_to_mismatch   = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.MIS_TABLE_NAME}'
         self.path_to_staging    = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
@@ -397,6 +566,24 @@ class ETLModule_POS:
         self.dev = config.get('dev',True)
         self.log = {}
 
+    def truncate_staging(self):
+        tablePath = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
+        empty_df = spark.createDataFrame([], schema=spark.read.format("delta").load(tablePath).schema)
+        empty_df.write.format("delta").mode("overwrite").save(tablePath)
+        self.stagingSchema = spark.read.load(tablePath).limit(0)
+        return True
+
+class ETLModule_POS(POS):
+    dev = None
+    def __init__(self, config):
+        # assert , keys in config, 'Missing keys in config'
+        super().__init__(config)
+        self.FILE_NAME = config["FILE_NAME"]
+        self.FILE_PATH_ON_LAKE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Ingest/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{self.FILE_NAME}'
+        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.list_Processed_file = [x.name for x in notebookutils.fs.ls(f"abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/")]
+
         if self.dev:
             print("===============================================================")
             print(f'Running {self.FILE_NAME} in dev mode')
@@ -406,15 +593,6 @@ class ETLModule_POS:
             print(f'Running {self.FILE_NAME}')
             print("===============================================================")
 
-
-
-    def truncate_staging(self):
-        tablePath = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
-        empty_df = spark.createDataFrame([], schema=spark.read.format("delta").load(tablePath).schema)
-        empty_df.write.format("delta").mode("overwrite").save(tablePath)
-        self.stagingSchema = spark.read.load(tablePath).limit(0)
-        return True
-        
     def getLastId(self):
         self.LastId = self.FactFileHandler.new_file_key
         return True
@@ -505,14 +683,9 @@ class ETLModule_POS:
     def load_to_fact(self):
         print('\t\tload to fact...')
         # TODO []: add load to fact function
-        self.loadtofactObj = LoadToFact(self.path_to_fact_table, self.path_to_mismatch, self.stagingTable, self.CATEGORY, self.SUBCATEGORY,self.WS_ID,self.SilverLH_ID, self.factTable, self.mismatchTable)
+        self.loadtofactObj = LoadToFact_main(self.path_to_fact_table, self.path_to_mismatch, self.stagingTable, self.CATEGORY, self.SUBCATEGORY,self.WS_ID,self.SilverLH_ID, self.factTable, self.mismatchTable)
         print('\t\t\tStarting Load to Fact are going to run()')
         self.loadtofactObj.run()
-
-        # raise NotImplementedError('Demo Error to Test for force stoping: loadstatus = 99')
-    
-       
-        # raise NotImplementedError('Wait to implement "load_to_fact"')
 
     def remove_from_fact(self,rows_to_delete):
         '''
@@ -632,30 +805,58 @@ class ETLModule_POS:
             self.addToFactFile(2)
             print("========================================================================================")
 
-class Mismatch_POS:
+class MismatchModule_POS(POS):
     dev = None
     def __init__(self, config):
-        # assert , keys in config, 'Missing keys in config'
-        self.config = config
-        self.WS_ID = config["WS_ID"]
-        self.BronzeLH_ID = config["BronzeLH_ID"]
-        self.SilverLH_ID = config["SilverLH_ID"]
-        self.CATEGORY = config["CATEGORY"]
-        self.SUBCATEGORY = config["SUBCATEGORY"]
-        self.FILE_NAME = config["FILE_NAME"]
-        self.FILE_PATH_ON_LAKE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Ingest/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{self.FILE_NAME}'
-        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
-        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
-        self.STAGING_TABLE_NAME = 'stagingPos'   + {'TRN':'Trn','PMT':'Payment','LUB':'Lube','AR_TRANSACTIONS':'AR','DSC':'Discount','EOD_METERS':'Meter','POINTS':'Points','REFUND':'Refund','EOD_TANKS':'Tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.FACT_TABLE_NAME    = 'factpos'      + {'TRN':'fuelsales','PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.MIS_TABLE_NAME     =  'mismatchpos' + {'TRN':'trn',  'PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.list_Processed_file = [x.name for x in notebookutils.fs.ls(f"abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/")]
-        self.path_to_fact_table = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.FACT_TABLE_NAME}'
-        self.path_to_mismatch   = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.MIS_TABLE_NAME}'
-        self.path_to_staging    = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
-        self.mismatchTable = spark.read.load(self.path_to_mismatch)
-        self.stagingTable = spark.read.load(self.path_to_staging).limit(0)
-        self.factTable = spark.read.load(self.path_to_fact_table)
-        self.FactFileHandler = FactFileHandler(self.WS_ID,self.SilverLH_ID)
-        self.dev = config.get('dev',True)
-        self.log = {}
+        super().__init__(config)
+
+    def truncate_mismatch(self):
+        spark.read.load(self.path_to_mismatch).limit(0).write.mode('overwrite').save(self.path_to_mismatch)
+
+    def getstagingFromMismatch(self):
+        self.stagingTable = spark.read.load(self.path_to_mismatch)
+        self.truncate_mismatch()
+
+    def updateLoadStatusTo1(self):
+        query = f"""
+        UPDATE SilverLH.factfile
+        SET LoadStatus = 1
+        WHERE FileKey IN (
+            SELECT FileKey
+            FROM BronzeLH.{self.STAGING_TABLE_NAME}
+            WHERE FileKey NOT IN (
+                SELECT FileKey
+                FROM SilverLH_POS.{self.MIS_TABLE_NAME}
+            )
+        )
+        """
+        spark.sql(query)
+
+    def load_staging_mismatch(self):
+        print("\tStarting Load Staging from mismatch process...")
+
+        if not self.truncate_staging():
+            raise Exception("Failed to truncate staging.")
+
+        if not self.getstagingFromMismatch():
+            raise Exception("Failed to load data to staging.")
+        print(f"\tLoad to Staging complete: size of staging = {self.stagingTable.count()}")
+        print('\tLoad Staging process completed successfully')
+
+    def load_to_fact_mismatch(self):
+        print('\t\tload to fact for mismatch...')
+        self.loadtofactObj = LoadToFact_mismatch(self.path_to_fact_table, self.path_to_mismatch, self.stagingTable, self.CATEGORY, self.SUBCATEGORY,self.WS_ID,self.SilverLH_ID, self.factTable, self.mismatchTable)
+        print('\t\t\tStarting Load to Fact for mismatch are going to run()')
+        self.loadtofactObj.run()
+
+    def runMisMatch(self):
+        print("Starting Mismatch process...")
+        self.load_staging_mismatch()
+
+        print("Starting main ETL process...")
+        self.load_to_fact_mismatch()
+        
+        print("Starting update LoadStatus in FactFile...")
+        self.updateLoadStatusTo1()
+
+        print("ETL mismatch process completed successfully.")
