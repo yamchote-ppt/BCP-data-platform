@@ -668,7 +668,7 @@ class ETLModule_POS(POS):
         if not self.getLastId():
             raise Exception("Failed to load factfile.")
         print(f"\tget the last id in Factfile complete: LastId = {self.LastId}")
-
+    
         # raise NotImplementedError('Demo Error to Test for loadstatus to 2')
 
         if not self.getstagingFromRaw():
