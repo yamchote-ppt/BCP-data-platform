@@ -218,7 +218,8 @@ class LoadToFact_main(LoadToFact):
 
     def lookUpStation_FLOWCO_TANKS(self, incomingDF, POSCode_key, CustomerCode_key):
         print('\t\t\t\t\tStarting Lookup Station...')
-        tmpDimstation = self.dimStation.select('StationKey','CustomerCode','POSCode')
+        tmpDimstation = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimstation')\
+                               .select(col('StationKey'),col('CustomerCode'),col('POSCode')).drop_duplicates()
         incomingDF = incomingDF.withColumns({'key1':col('POSCode'),'key2':col('CustomerCode')})
         dimstationjoin = tmpDimstation.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
         lookupCondition = ['key1','key2']
@@ -232,11 +233,11 @@ class LoadToFact_main(LoadToFact):
     def lookUpProduct_FLOWCO_TANKS(self, incomingDF, mappingProduct):
         print('\t\t\t\t\tStarting Lookup Product...')
 
-        incomingDF = incomingDF.withColumns({'key1':col('GradeNumber')})
-        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1'}).drop_duplicates()
-        lookupCondition = ['key1']
-        matchTable = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1')
-        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1')
+        incomingDF = incomingDF.withColumns({'key1':col('GradeNumber'), 'key2':trim(col('GradeTitle'))})
+        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'}).drop_duplicates()
+        lookupCondition = ['key1','key2']
+        matchTable = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
         # assert incomingDF.count() == matchTable.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct'
 
         UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0)) 
@@ -321,7 +322,7 @@ class LoadToFact_main(LoadToFact):
                 mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS')).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
                 mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull())).select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
                 matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='GradeNumber', SourceTitle_key='GradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
-                UnMatchProduct = UnMatchProduct.filter((col('GradeNumber') == 2) & (col('OpenVolume') == 0) & (col('CloseVolume') == 0) & (col('DeliveryVolume') == 0))
+                UnMatchProduct = UnMatchProduct.filter((col('GradeNumber').cast(IntegerType()) == 2) & (col('OpenVolume').cast(IntegerType()) == 0) & (col('CloseVolume').cast(IntegerType()) == 0) & (col('DeliveryVolume').cast(IntegerType()) == 0))
 
                 UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct).drop('ReStationName')
                 matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'})
@@ -329,7 +330,7 @@ class LoadToFact_main(LoadToFact):
             elif self.CATEGORY.upper() == 'FLOWCO':
                 matchStation, UnMatchStation = self.lookUpStation_FLOWCO_TANKS(self.stagingTable, POSCode_key='POSCode', CustomerCode_key='CustomerCode')
 
-                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION')).select(col('SourceKey'),col('MappingKey'))
+                mappingProduct = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mappingproduct').filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TANKS')).select(col('SourceKey'),col('MappingKey'), col('SourceTitle')).drop_duplicates()
                 matchFinal, UnMatchProduct = self.lookUpProduct_FLOWCO_TANKS(matchStation, mappingProduct=mappingProduct)
                 self.log['UnMatchStation'] = UnMatchStation
                 self.log['UnMatchProduct'] = UnMatchProduct
@@ -556,11 +557,6 @@ class LoadToFact_mismatch(LoadToFact):
             print(f'matchFinal.count() = {matchFinal.count()}')
 
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct_FirstPro,allowMissingColumns=True).unionByName(UnMatchProduct_FlowCo,allowMissingColumns=True)
-
-
-
-
-
 
         elif self.SUBCATEGORY.upper() == 'METERS': 
             matchStation, UnMatchStation = self.lookUpStation(
@@ -887,7 +883,7 @@ class FactFileHandler:
 
         self.records = []
         for FILE_NAME in FILENAME_FILEKEY_mapper:
-            print(FILE_NAME)
+            # print(FILE_NAME)
             self.records.append(
                 Row(
                     FileKey=FILENAME_FILEKEY_mapper[FILE_NAME],
@@ -927,6 +923,7 @@ class POS:
         self.path_to_staging    = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
         self.mismatchTable = spark.read.load(self.path_to_mismatch)
         self.stagingTable = spark.read.load(self.path_to_staging).limit(0)
+        self.stagingColumns = self.stagingTable.columns
         self.factTable = spark.read.load(self.path_to_fact_table)
         self.FactFileHandler = FactFileHandler(self.WS_ID,self.SilverLH_ID)
         self.dev = config.get('dev',True)
@@ -934,9 +931,9 @@ class POS:
 
     def truncate_staging(self):
         tablePath = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
+        self.stagingSchema = spark.read.load(tablePath).limit(0)
         empty_df = spark.createDataFrame([], schema=spark.read.format("delta").load(tablePath).schema)
         empty_df.write.format("delta").mode("overwrite").save(tablePath)
-        self.stagingSchema = spark.read.load(tablePath).limit(0)
         return True
 
 class ETLModule_POS(POS):
@@ -1046,6 +1043,12 @@ class ETLModule_POS(POS):
             print('\t\tFile is blank')
 
         self.stagingTable = utils.copySchemaByName(df,self.stagingSchema) #spark.createDataFrame([],schema=self.stagingSchema.schema)
+        if self.CATEGORY == 'FLOWCO' and self.SUBCATEGORY == 'PAYMENT':
+            self.stagingTable.withColumns({"PAY_Date":lit(None),"PAY_Time":lit(None),"End_Date":lit(None),"End_Time":lit(None)}).select(self.stagingSchema.columns).write.mode('overwrite').save(self.path_to_staging)
+
+        else:
+            self.stagingTable.select(self.stagingSchema.columns).write.mode('overwrite').save(self.path_to_staging)
+
         # self.stagingTable = spark.createDataFrame(df[self.stagingSchema.columns],schema=self.stagingSchema.schema)
         self.stagingTable = utils.fillNaAll(self.stagingTable)
         self.stagingTable = utils.trim_string_columns(self.stagingTable)
@@ -1083,6 +1086,9 @@ class ETLModule_POS(POS):
                 notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.BadFilesDir)
         return True
 
+    def removeRevisitRecord(self):
+        pass
+
     def load_staging(self):
         print("\tStarting Load Staging process...")
 
@@ -1098,6 +1104,14 @@ class ETLModule_POS(POS):
         if not self.getstagingFromRaw():
             raise Exception("Failed to load data to staging.")
         print(f"\tLoad to Staging complete: size of staging = {self.stagingTable.count()}")
+
+        # existingFileName = 
+        # rows_to_delete = self.FactFileHandler.factFile.filter(col("FileName").isin(existingFileName)).select("FileKey",'LoadStatus')
+
+        # self.remove_from_fact(rows_to_delete)
+        # self.remove_from_mismatch(rows_to_delete)
+        # self.updateFactFile_in_remove_previous(rows_to_delete)
+
         print('\tLoad Staging process completed successfully')
 
     def updateGradeAndHose(self):
@@ -1162,20 +1176,16 @@ class ETLModule_POS(POS):
         self.FactFileHandler.factFile = self.FactFileHandler.factFile.withColumn('LoadStatus',when(col('FileKey').isin(rows_to_update), 4).otherwise(col('LoadStatus')))
         self.FactFileHandler.saveTable()
 
-
-    def remove_previous_data(self, FILE_NAME):
-        # window_spec = Window.partitionBy("FileKey").orderBy(col("LoadDateKey").desc(), col("LoadTimeKey").desc())
-        # factFile_with_rownr = self.FactFileHandler.factFile.filter(col("FileName") == FILE_NAME).withColumn("RowNr", row_number().over(window_spec)) # recheck again whether the latest fileKey is store to factFile
-        # rows_to_delete = factFile_with_rownr.filter((col("RowNr") > 1)).select("FileKey",'LoadStatus')
+    def remove_previous_data(self, sameFile):
+        # sameFile is a list of filename that have ever been processed before ( now itis duplicate in fact table )
         self.log['factfile'] = self.FactFileHandler.factFile
-        rows_to_delete = self.FactFileHandler.factFile.filter(col("FileName") == FILE_NAME).select("FileKey",'LoadStatus')
+        rows_to_delete = self.FactFileHandler.factFile.filter(col("FileName").isin(sameFile)).select("FileKey",'LoadStatus')
         # raise NotImplementedError('Demo Error to Test for remove_previous_data error: loadstatus = 3')
     
         self.remove_from_fact(rows_to_delete)
         self.remove_from_mismatch(rows_to_delete)
         self.updateFactFile_in_remove_previous(rows_to_delete)
         
-
     def move_to_processed(self,FILENAME_FILEKEY_mapper):
         """
         Move the file to the processed directory.
@@ -1191,7 +1201,7 @@ class ETLModule_POS(POS):
                 # print('\t\t\tfile already exists: meaning that this file name have ever been processed', end=': ')
                 try:
                     # print(f'The old records of {FILE_NAME} is being removed ...')
-                    self.remove_previous_data(FILE_NAME)
+                    # self.remove_previous_data(FILE_NAME)
                     # print(f'\t\t\tRemoved finished!', end=' ----> ')
                     if not self.dev:
                         # print(f'move file {FILE_NAME} to processed ...', end=' ----> ')
@@ -1211,8 +1221,11 @@ class ETLModule_POS(POS):
                         self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
                 except:
                     self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-                
-        print(f'\t\tFile that have ever come: {sameFile}')
+        
+        # now we have a list of existing filename (sameFile)
+        self.remove_previous_data(sameFile)
+
+        print(f'\t\tnum file that have ever come = {len(sameFile)}')
         print('\t\t updating fact file ...')
         self.addToFactFile(self.FILENAME_FILEKEY_mapper_succes, 1)
         self.addToFactFile(self.FILENAME_FILEKEY_mapper_fail, 3)
@@ -1223,16 +1236,13 @@ class ETLModule_POS(POS):
             if FILE_INFO.size == 0:
                 notebookutils.fs.mv(FILE_INFO.path,os.path.join(self.BlankdDir,FILE_INFO.name),create_path=True, overwrite=True)
 
-
     def main_ETL(self):
         if self.SUBCATEGORY.upper() in ['TRN', 'AR', ]: # TODO: add package need `updateGradeAndHose`
             print("\tStarting UPDATE GRADE AND HOSE")
             self.updateGradeAndHose()
         print("\tStarting main ETL process...")
         self.load_to_fact()
-        # at here, fact table should be processed completely and save to lake
-        # no any returned object
-
+    
         if not self.move_to_processed(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
             raise AssertionError('error in move_to_processed with load status = 3')
         self.moveBlankFile()
@@ -1351,3 +1361,4 @@ class MismatchModule_POS(POS):
         self.updateLoadStatusTo1()
 
         print("ETL mismatch process completed successfully.")
+
