@@ -9,7 +9,6 @@ import re
 import os
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
-from datetime import datetime
 import env.utils as utils
 from pyspark.sql.window import Window
 import shutil
@@ -17,6 +16,7 @@ from decimal import Decimal
 import notebookutils
 import hashlib
 from tqdm import tqdm
+import time
 
 from typing import Callable, List, Dict, Any
 # from tabulate import tabulate
@@ -275,7 +275,7 @@ class LoadToFact_main(LoadToFact):
                 mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull())).select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
 
             matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='Grade', SourceTitle_key='ReGradeTitle', StationKey_key='StationKey', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
-            UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct)
+            UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct).withColumn('YearKey',lit(None))
 
             if self.CATEGORY.upper() == 'FIRSTPRO':
                 match1 = matchFinal.filter(col('Volume')>=0).orderBy('FileKey','TransNumber','CloseDateKey').drop('Volume','Amount')
@@ -349,12 +349,17 @@ class LoadToFact_main(LoadToFact):
         print('\t\t\t\tLookup process completed')
 
     def saveMatchTable(self,path_to_save):
+        print('\t\t\t\t\tbefore save matchFinal.count() = ',spark.read.load(path_to_save).count())
         self.matchFinal.write.mode('append').save(path_to_save)
         print('\t\t\t\t\tmatchFinal.count() = ',self.matchFinal.count(), f'is added to {path_to_save}')
+        print('\t\t\t\t\tafter save matchFinal.count() = ',spark.read.load(path_to_save).count())
 
     def saveMisMatchTable(self,path_to_save):
+        print('\t\t\t\t\tbefore save mismatchFinal.count() = ',spark.read.load(path_to_save).count())
         self.UnMatchFinal.write.mode('append').save(path_to_save)
         print('\t\t\t\t\tUnMatchFinal.count() = ',self.UnMatchFinal.count(), f'is added to {path_to_save}')
+        print('\t\t\t\t\tafter save mismatchFinal.count() = ',spark.read.load(path_to_save).count())
+
 
     def run(self):
         print('\t\t\tStarting Load to Fact... by loadtofactObj.run()')
@@ -831,15 +836,15 @@ class FactFileHandler:
         return str(self.new_record)
 
     def getLastId_from_lake(self):
-        maxFileKey = spark.sql("SELECT MAX(FileKey) as maxFileKey FROM SilverLH.factfile").collect()[0].maxFileKey
+        maxFileKey = self.factFile.selectExpr('MAX(FileKey) as maxFileKey').collect()[0].maxFileKey #spark.sql("SELECT MAX(FileKey) as maxFileKey FROM SilverLH.factfile").collect()[0].maxFileKey
         LastId = maxFileKey + 1
         return LastId
 
     def reload(self):
-        self.factFile = spark.read.load(self.path_to_factfile).withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).cache()
+        self.factFile = spark.read.load(self.path_to_factfile).withColumn('LoadStatus', col('LoadStatus').cast(ShortType()))
     
     def saveTable(self):
-        self.factFile.withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).write.mode('overwrite').partitionBy('LoadStatus').save(self.path_to_factfile)
+        self.factFile.withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).write.mode('overwrite').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).option('mergeSchema','true').option('mergeSchema','true').save(self.path_to_factfile)
 
     
     def addNewRecord(self):
@@ -854,7 +859,7 @@ class FactFileHandler:
             LoadStatus=self.new_record['LoadStatus']
             )
         new_row_df = spark.createDataFrame([new_row], schema = self.factFile.schema)
-        new_row_df.withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).write.mode('append').partitionBy('LoadStatus').save(self.path_to_factfile)
+        new_row_df.withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).write.mode('append').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).option('mergeSchema','true').option('mergeSchema','true').save(self.path_to_factfile)
         self.reload()
     
     def editRecord_byFileKey(self,FileKey: int,keyChange: Dict[str,Any] ,LoadStatusList: List[int] = None) -> None:
@@ -899,7 +904,26 @@ class FactFileHandler:
         self.new_rows_df = spark.createDataFrame(self.records, schema = self.factFile.schema)
         self.new_rows_df = self.new_rows_df.withColumn('LoadStatus', col('LoadStatus').cast(ShortType()))
         self.log['new_rows_df'] = self.new_rows_df
-        self.new_rows_df.write.mode('append').partitionBy('LoadStatus').save(self.path_to_factfile)
+        self.new_rows_df.write.mode('append').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).option('mergeSchema','true').option('mergeSchema','true').save(self.path_to_factfile)
+        self.reload()
+
+    def EditManyRecords(self, FILENAME_FILEKEY_mapper, LoadStatus):
+        self.reload()
+        self.factFile = self.factFile.withColumn(
+            'LoadStatus',
+            when(col('FileKey').isin(list(FILENAME_FILEKEY_mapper.values())), LoadStatus).otherwise(col('LoadStatus'))
+        )
+        success = False
+        retries = 0
+        while not success and retries < 10:
+            try:
+                self.factFile.withColumn('LoadStatus', col('LoadStatus').cast(ShortType())).write.mode('overwrite').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).option('mergeSchema','true').option('mergeSchema','true').save(self.path_to_factfile)
+                success = True
+            except:
+                retries += 1
+                time.sleep(5)
+        if not success:
+            raise Exception("Failed to update LoadStatus in FactFile after 5 retries.")
         self.reload()
         
 class POS:
@@ -971,12 +995,12 @@ class ETLModule_POS(POS):
             print(f'Running {self.CATEGORY} | {self.SUBCATEGORY}')
             print("===============================================================")
 
-    def getLastId(self):
-        self.LastId = self.FactFileHandler.new_file_key
-        return True
+    # def getLastId(self):
+    #     self.LastId = self.FactFileHandler.new_file_key
+    #     return True
 
     def readFilePos(self, names):
-        current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
+        self.current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
         # return pd.read_csv(self.FILE_PATH_ON_LAKE,encoding='TIS-620',delimiter='|',header=None,names=names)
         df = spark.read.format("csv") \
             .option("encoding", "TIS-620").option("delimiter", "|") \
@@ -1027,10 +1051,13 @@ class ETLModule_POS(POS):
         df = self.readFilePos(names = columns)
         print('\tFile is already read')
 
-        window_spec = Window.orderBy(col("FileName").asc())
-        df = df.withColumn('FileKey', dense_rank().over(window_spec)-1 + self.LastId)
+        window_spec = Window.partitionBy("FileName").orderBy(col("FileKey").desc())
+        self.FactFile = spark.read.load(self.FactFileHandler.path_to_factfile)
+        self.tmpFactFile = self.FactFile.filter((col('CategoryName')==self.CATEGORY)&(col('SubcategoryName')==self.SUBCATEGORY)&(col('LoadStatus').isNull()))
+        self.tmpFactFile = self.tmpFactFile.withColumn("RowNum", row_number().over(window_spec))
+        self.lookUpFileKey = self.tmpFactFile.filter(col('RowNum')==1).select('FileName','FileKey').withColumn('FileKey',col('FileKey').cast(IntegerType()))
+        df = df.join(self.lookUpFileKey, on='FileName', how='left')
         # df = df.withColumn('FileKey_',generate_filekey_udf(df['filename'], df['load_date']))
-        # df['FileKey'] = self.LastId
 
         if self.SUBCATEGORY == 'TRN':
             df = df.withColumn('YearKey',lit(None)) # df['YearKey'] = None
@@ -1076,6 +1103,14 @@ class ETLModule_POS(POS):
             )
         return True
 
+    # def EditFactFile(self, FILENAME_FILEKEY_mapper, status_code):
+    #     # do in batch
+    #     self.FactFileHandler.EditManyRecords(
+    #         FILENAME_FILEKEY_mapper=FILENAME_FILEKEY_mapper,
+    #         LoadStatus=status_code
+    #         )
+    #     return True
+
     def move_to_badfile(self, FileNameList):
         # `FileNameList`` 
         print('move all to badfiles')
@@ -1086,18 +1121,15 @@ class ETLModule_POS(POS):
                 notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.BadFilesDir)
         return True
 
-    def removeRevisitRecord(self):
-        pass
-
     def load_staging(self):
         print("\tStarting Load Staging process...")
 
         if not self.truncate_staging():
             raise Exception("Failed to truncate staging.")
 
-        if not self.getLastId():
-            raise Exception("Failed to load factfile.")
-        print(f"\tget the last id in Factfile complete: LastId = {self.LastId}")
+        # if not self.getLastId():
+        #     raise Exception("Failed to load factfile.")
+        # print(f"\tget the last id in Factfile complete: LastId = {self.LastId}")
     
         # raise NotImplementedError('Demo Error to Test for loadstatus to 2')
 
@@ -1125,66 +1157,35 @@ class ETLModule_POS(POS):
         print('\t\t\tStarting Load to Fact are going to run()')
         self.loadtofactObj.run()
 
-    def remove_from_fact(self,rows_to_delete):
-        '''
-            delete from factPosAR where filekey in (
-            select filekey
-            from(
-            select ROW_NUMBER() OVER (ORDER BY loaddatekey desc,loadtimekey desc) AS RowNr,filekey,LoadDateKey,LoadTimeKey
-            from factFile
-            where filename = '20180719#991211007EOD_METERS.CSV'
-            )tmp where rownr > 1);
-        '''
-        factTable_remaining = self.factTable.join(rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
+    def remove_from_fact(self):
+        factTable_remaining = self.factTable.join(self.rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
         factTable_remaining.write.mode("overwrite").save(self.path_to_fact_table)
         self.factTable = spark.read.load(self.path_to_fact_table)
 
-    def remove_from_mismatch(self,rows_to_delete):
-        '''
-            delete from mismatchposar where filekey in (
-                select filekey
-                from(
-                    select
-                        ROW_NUMBER() OVER (ORDER BY loaddatekey desc,loadtimekey desc) AS RowNr,
-                        filekey,
-                        LoadDateKey,
-                        LoadTimeKey
-                    from
-                        factFile
-                    where
-                        filename = '20180719#991211007EOD_METERS.CSV'
-            )tmp where rownr > 1); 
-        '''
-        mismatchTable_remaining = self.mismatchTable.join(rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
+    def remove_from_mismatch(self):
+        mismatchTable_remaining = self.mismatchTable.join(self.rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
         mismatchTable_remaining.write.mode("overwrite").save(self.path_to_mismatch)
         self.mismatchTable = spark.read.load(self.path_to_mismatch)
 
-    def updateFactFile_in_remove_previous(self,rows_to_delete):
-        rows_to_update = rows_to_delete.filter(col('LoadStatus').isin([1,3,5])).select("FileKey").collect()
+    def updateFactFile_in_remove_previous(self):
+        print('updateFactFile_in_remove_previous')
+        rows_to_update = self.rows_to_delete.filter(col('LoadStatus').isin([1,3,5])).select("FileKey").collect()
         rows_to_update = [r.FileKey for r in rows_to_update]
-        '''
-            update factfile
-            set LoadStatus = 4 -- means file that have the same file coming to system: no longer such keyfile exists in fact table
-            where filekey in (
-            select filekey
-            from(
-            select ROW_NUMBER() OVER (ORDER BY loaddatekey desc,loadtimekey desc) AS RowNr,filekey,LoadDateKey,LoadTimeKey
-            from factFile
-            where filename = '20180719#991211007EOD_METERS.CSV'
-            )tmp where rownr > 1  and loadstatus in (1,3,5));
-        '''
         self.FactFileHandler.factFile = self.FactFileHandler.factFile.withColumn('LoadStatus',when(col('FileKey').isin(rows_to_update), 4).otherwise(col('LoadStatus')))
         self.FactFileHandler.saveTable()
 
-    def remove_previous_data(self, sameFile):
+    def remove_previous_data(self):
         # sameFile is a list of filename that have ever been processed before ( now itis duplicate in fact table )
         self.log['factfile'] = self.FactFileHandler.factFile
-        rows_to_delete = self.FactFileHandler.factFile.filter(col("FileName").isin(sameFile)).select("FileKey",'LoadStatus')
+        window_spec = Window.partitionBy("FileName").orderBy(col("FileKey").desc())
+        self.rows_to_delete = self.FactFileHandler.factFile.filter(col("FileName").isin(self.sameFile)).withColumn("row_number", row_number().over(window_spec)) \
+                                   .filter(col("row_number") > 1) \
+                                   .select("FileKey", 'LoadStatus')
+        # self.rows_to_delete includes only old records (keeping only the greatest FileKey for each FileName)
         # raise NotImplementedError('Demo Error to Test for remove_previous_data error: loadstatus = 3')
     
-        self.remove_from_fact(rows_to_delete)
-        self.remove_from_mismatch(rows_to_delete)
-        self.updateFactFile_in_remove_previous(rows_to_delete)
+        self.remove_from_fact()
+        self.remove_from_mismatch()
         
     def move_to_processed(self,FILENAME_FILEKEY_mapper):
         """
@@ -1194,41 +1195,35 @@ class ETLModule_POS(POS):
         self.FILENAME_FILEKEY_mapper_fail = {}
         print(f'\t\tmove file to processed ...: num of file = {len(self.FileNameList)}')
 
-        sameFile = []
+        self.sameFile = []
         for FILE_NAME in self.FileNameList:
             if FILE_NAME in self.list_Processed_file:
-                sameFile.append(FILE_NAME)
-                # print('\t\t\tfile already exists: meaning that this file name have ever been processed', end=': ')
-                try:
-                    # print(f'The old records of {FILE_NAME} is being removed ...')
-                    # self.remove_previous_data(FILE_NAME)
-                    # print(f'\t\t\tRemoved finished!', end=' ----> ')
-                    if not self.dev:
-                        # print(f'move file {FILE_NAME} to processed ...', end=' ----> ')
-                        notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=True)
-                        # print(f'file {FILE_NAME} was moved')
-                        self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-                except:
-                    self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-    
-            else:
-                # print('\t\t\tThis File is the new one', end=': ')
-                try:
-                    if not self.dev:
-                        # print(f'move file {FILE_NAME} to processed ...', end=' ----> ')
-                        notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=False)
-                        # print(f'file {FILE_NAME} was moved')
-                        self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-                except:
-                    self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
+                self.sameFile.append(FILE_NAME)
+
+            try:
+                if not self.dev:
+                    notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=True)
+                    self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
+            except:
+                self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
         
         # now we have a list of existing filename (sameFile)
-        self.remove_previous_data(sameFile)
 
-        print(f'\t\tnum file that have ever come = {len(sameFile)}')
-        print('\t\t updating fact file ...')
-        self.addToFactFile(self.FILENAME_FILEKEY_mapper_succes, 1)
-        self.addToFactFile(self.FILENAME_FILEKEY_mapper_fail, 3)
+        print(f'\t\tnum file that have ever come = {len(self.sameFile)}')
+        
+        # print('\t\t updating fact file ...') #move outside to do in batch
+        # self.addToFactFile(self.FILENAME_FILEKEY_mapper_succes, 1)
+        # self.addToFactFile(self.FILENAME_FILEKEY_mapper_fail, 3)
+        # self.EditFactFile(, 1) #ETL success and move file to processed
+        # self.EditFactFile(self.FILENAME_FILEKEY_mapper_fail, 3) #ETL success but move file to processed failed
+        # self.FactFileHandler.EditManyRecords(
+        #     FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_succes,
+        #     LoadStatus=1
+        #     )
+        # self.FactFileHandler.EditManyRecords(
+        #     FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_fail,
+        #     LoadStatus=3
+        #     )
         return True
 
     def moveBlankFile(self):
@@ -1236,19 +1231,33 @@ class ETLModule_POS(POS):
             if FILE_INFO.size == 0:
                 notebookutils.fs.mv(FILE_INFO.path,os.path.join(self.BlankdDir,FILE_INFO.name),create_path=True, overwrite=True)
 
+    def move_file(self):
+        if not self.move_to_processed(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
+            raise AssertionError('error in move_to_processed with load status = 3')
+
     def main_ETL(self):
         if self.SUBCATEGORY.upper() in ['TRN', 'AR', ]: # TODO: add package need `updateGradeAndHose`
             print("\tStarting UPDATE GRADE AND HOSE")
             self.updateGradeAndHose()
         print("\tStarting main ETL process...")
         self.load_to_fact()
-    
-        if not self.move_to_processed(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
-            raise AssertionError('error in move_to_processed with load status = 3')
-        self.moveBlankFile()
+
+    def updateFactFile_final(self):
+        print('updateFactFile_final')
+        self.FactFileHandler.EditManyRecords(
+            FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_succes,
+            LoadStatus=1
+            )
+        self.FactFileHandler.EditManyRecords(
+            FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_fail,
+            LoadStatus=3
+            )
 
     def post_ETL(self):
-        pass
+        print('Start post_ETL...')
+        self.updateFactFile_in_remove_previous()
+        self.updateFactFile_final()
+        print('post_ETL complete')
 
     def run_ETL(self):
         print("Starting ETL process...")
@@ -1256,8 +1265,14 @@ class ETLModule_POS(POS):
             self.load_staging()
             try:
                 self.main_ETL()
+                self.move_file()
+                self.remove_previous_data()
+                self.moveBlankFile()
+                # self.post_ETL()
                 print("ETL process completed successfully.")
                 print("========================================================================================")
+                return self # to call post_ETL outside sequential
+
             except Exception as e:
                 print(f"\t\tmain ETL process failed: {e}")
                 self.move_to_badfile(self.FileNameList)
@@ -1272,6 +1287,7 @@ class ETLModule_POS(POS):
                 pass
             # self.addToFactFile(2)
             print("========================================================================================")
+
 
 class MismatchModule_POS(POS):
     dev = None
@@ -1314,7 +1330,7 @@ class MismatchModule_POS(POS):
         return True
 
     def updateLoadStatusTo1(self):
-
+        print("Starting update LoadStatus in FactFile...")
         fileKeyUpdate = spark.sql(f"""
                                 SELECT FileKey
                                 FROM BronzeLH_POS.{self.STAGING_TABLE_NAME}
@@ -1327,10 +1343,23 @@ class MismatchModule_POS(POS):
         toUpdate = self.FactFileHandler.factFile.join(fileKeyUpdate, on='FileKey', how='inner').withColumn('LoadStatus', lit(1).cast(ShortType()))
         toSame = self.FactFileHandler.factFile.join(fileKeyUpdate, on='FileKey', how='left_anti')
         newFactFile = toUpdate.unionByName(toSame)
-        newFactFile.write.mode('overwrite').partitionBy('LoadStatus').save(self.FactFileHandler.path_to_factfile)
+
+        success = False
+        retries = 0
+        while not success and retries < 10:
+            try:
+                newFactFile.write.mode('overwrite').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).option('mergeSchema','true').option('mergeSchema','true').save(self.FactFileHandler.path_to_factfile)
+                success = True
+            except:
+                retries += 1
+                time.sleep(5)
+        if not success:
+            raise Exception("Failed to update LoadStatus in FactFile after 5 retries.")
+
         self.FactFileHandler.reload()
 
     def load_staging_mismatch(self):
+        print("Starting Mismatch process...")
         print("\tStarting Load Staging from mismatch process...")
 
         if not self.truncate_staging():
@@ -1342,6 +1371,7 @@ class MismatchModule_POS(POS):
         print('\tLoad Staging process completed successfully')
 
     def load_to_fact_mismatch(self):
+        print("Starting main ETL process...")
         print('\t\tload to fact for mismatch...')
         self.loadtofactObj = LoadToFact_mismatch(self.path_to_fact_table, self.path_to_mismatch, self.stagingTable, self.CATEGORY, self.SUBCATEGORY,self.WS_ID,self.SilverLH_ID, self.factTable, self.mismatchTable)
         print('\t\t\tStarting Load to Fact for mismatch are going to run()')
@@ -1351,14 +1381,11 @@ class MismatchModule_POS(POS):
         '''
         Executor for Mismatch process
         '''
-        print("Starting Mismatch process...")
-        self.load_staging_mismatch() # load from mismatch table -> staging
-
-        print("Starting main ETL process...")
-        self.load_to_fact_mismatch()
         
-        print("Starting update LoadStatus in FactFile...")
-        self.updateLoadStatusTo1()
-
+        self.load_staging_mismatch() # load from mismatch table -> staging        
+        self.load_to_fact_mismatch()
+        # self.updateLoadStatusTo1()
         print("ETL mismatch process completed successfully.")
+
+        return self #to call updateLoadStatusTo1 outside sequential
 
