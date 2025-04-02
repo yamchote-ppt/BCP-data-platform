@@ -13,6 +13,7 @@ import env.utils as utils
 from pyspark.sql.window import Window
 import shutil
 import notebookutils
+from time import sleep
 # from tabulate import tabulate
 
 
@@ -271,6 +272,7 @@ class factBibo(Bibo):
 
         INSERT = SOURCE.join(TARGET, on=onKey, how='left_anti')
         print(f'{INSERT.count()} new added rows to SilverLH.{sourceTableName}')
+        spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{sourceTableName.lower()}').dropna().drop_duplicates().write.mode('overwrite').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{sourceTableName.lower()}')
         INSERT.write.mode('append').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{sourceTableName.lower()}')
 
     def updateDimBiboProvince(self,stagingbibodailysales):
@@ -283,6 +285,7 @@ class factBibo(Bibo):
 
         INSERT = SOURCE.join(TARGET, on=onKey, how='left_anti')
         print(f'{INSERT.count()} new added rows to SilverLH.dimbiboprovince')
+        spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimbiboprovince').dropna().drop_duplicates().write.mode('overwrite').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimbiboprovince')
         INSERT.withColumnRenamed('ProvinceKeyNotCompounded','ProvinceKey').write.mode('append').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimbiboprovince')
 
     def updateBibo(self,stagingbibodailysales):
@@ -292,16 +295,25 @@ class factBibo(Bibo):
         self.updateDimBiboProvince(stagingbibodailysales)
         self.updateDimBiboSomething(stagingbibodailysales, 'regiongroup')
 
-    def updateMTD(self,factbibodailysales, mismatchbibodailysales, todayFileKey):
+    def updateMTD(self,factbibodailysales, mismatchbibodailysales, todayFileKey, maxretry = 10):
         datekeys = factbibodailysales.filter(col('FileKey')==todayFileKey).select('DateKey').distinct() # extract DateKey corresponding to today's FileKey (yyyyMM01 - yyyyMMdd)
         FileKeys = factbibodailysales.select('FileKey','DateKey').join(datekeys,on='DateKey',how='inner').select('FileKey').distinct() # expect  to get only 2 FileKeys (yesterday and today)
         FileKeys = [row.FileKey for row in FileKeys.select("FileKey").collect()]
 
         newfactFile = self.factFile.withColumn('LoadStatus',when(col('FileKey').isin(FileKeys) & (col('FileKey')!=todayFileKey),lit(6).cast(ShortType())).otherwise(col('LoadStatus')))
-        newfactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
-            .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
 
-        self.factFile = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+        retry = 0
+        success = False
+        while (not success) and (retry <= maxretry):
+            try:
+                newfactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
+                    .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+
+                self.factFile = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+                success = True
+            except:
+                retry += 1
+                sleep(300)
 
         filekeys_to_delete = self.factFile.filter(\
             (col("CategoryName") == 'BIBO') &\
@@ -458,15 +470,3 @@ class MismatchBibo(Bibo):
         self.updLoadStatus1MisMatch(factBiboDailySales, MismatchBiboDailySales)
         factBiboDailySales.write.mode('append').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factbibodailysales')
         MismatchBiboDailySales.write.mode('overwrite').save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/mismatchbibodailysales')
-
-
-
-# 17482839 for 'MTD2024-12-26-07-40-42.xlsx'
-# 17492508 for 'MTD2024-12-27-07-40-45.xlsx'
-
-
-
-
-
-
-

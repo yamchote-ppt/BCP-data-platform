@@ -1,7 +1,7 @@
 # Welcome to your new notebook
 # Type here in the cell editor to add code!
 from pyspark.sql.functions import col, trim
-from pyspark.sql.types import IntegerType, DecimalType, StringType, LongType, TimestampType, StructType, StructField, DoubleType, FloatType, ShortType
+from pyspark.sql.types import IntegerType, DecimalType, StringType, LongType, TimestampType, StructType, StructField, DoubleType, FloatType, ShortType, DateType
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
 from typing import Union, List, Tuple, Any
@@ -38,7 +38,7 @@ class AuditLog_Fusion:
         def __repr__(self):
             return repr(self._data)
     
-    def __init__(self, columns: Union[List[str], Tuple[str, ...]], WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
+    def __init__(self, columns: Union[List[str], Tuple[str, ...]], WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema_check: str = None, schema_audit: str = None):
         '''
         - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
         - if using lakehouse with Schema, please provide `schema` parameter
@@ -48,16 +48,21 @@ class AuditLog_Fusion:
         self.AUDIT_TABLE_NAME = AUDIT_TABLE_NAME
         self.LH_ID_to_check = LH_ID_to_check
         self.LH_ID_audit = LH_ID_audit if LH_ID_audit else LH_ID_to_check
-        self.schema = schema
+        self.schema_check = schema_check
+        self.schema_audit = schema_audit
         self.fixColumns = {'STARTTIME','ENDTIME','AUDITKEY','STATUS_ACTIVITY'}
         self.columns = tuple(set(columns).union(self.fixColumns))
         
-        if self.schema:    
-            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.schema}/{self.AUDIT_TABLE_NAME}'
-            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.schema}/{self.TABLE_NAME_to_check}'
+        if self.schema_check:
+            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.schema_check}/{self.TABLE_NAME_to_check}'
+        else:
+            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.TABLE_NAME_to_check}'
+
+
+        if self.schema_audit:    
+            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.schema_audit}/{self.AUDIT_TABLE_NAME}'
         else:
             self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.AUDIT_TABLE_NAME}'
-            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.TABLE_NAME_to_check}'
         
         if not notebookutils.fs.exists(self.PATH_TO_AUDIT_TABLE):
             raise FileExistsError(f'Create you audit table first at path {self.PATH_TO_AUDIT_TABLE}')
@@ -136,14 +141,14 @@ class AuditLog_Fusion:
         self.log['STARTTIME'] = str(datetime.now() + timedelta(hours=7))
         self.log['STATUS_ACTIVITY'] = 'logging ...'
 
-class AuditLog_BCP(AuditLog_Fusion):
+class AuditLog_STGT(AuditLog_Fusion):
     
-    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
+    def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema_check: str = None, schema_audit: str = None):
         '''
         - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
         - if using lakehouse with Schema, please provide `schema` parameter
         '''
-        super().__init__(['PIPELINENAME', 'PIPELINERUNID', 'TRIGGERTYPE', 'TABLE_NAME', 'FUNCTION_NAME','COUNTROWSBEFORE', 'COUNTROWSAFTER', 'ERRORCODE', 'ERRORMESSAGE'] ,WS_ID, TABLE_NAME_to_check, AUDIT_TABLE_NAME, LH_ID_to_check, LH_ID_audit, schema)
+        super().__init__(['PIPELINENAME', 'PIPELINERUNID', 'TRIGGERTYPE', 'TABLE_NAME', 'FUNCTION_NAME','COUNTROWSBEFORE', 'COUNTROWSAFTER', 'ERRORCODE', 'ERRORMESSAGE'] ,WS_ID, TABLE_NAME_to_check, AUDIT_TABLE_NAME, LH_ID_to_check, LH_ID_audit, schema_check, schema_audit)
 
     def initialDetail(self,  pipelineName: str, pipelineId: str, TriggerType: str, TableName: str, functionName: str):
         super().initialDetail({
@@ -190,8 +195,9 @@ def fillNaAll(df):
         IntegerType: 0,
         DoubleType: 0.0,
         TimestampType: '1970-01-01 00:00:00',
+        DateType: '1970-01-01',
         LongType:0,
-        DecimalType:0.0,
+        DecimalType:.0,
     }
     fill_values = {}
     for field in df.schema.fields:

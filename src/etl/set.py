@@ -23,6 +23,7 @@ from typing import Callable, List, Dict, Any
 
 spark = SparkSession.builder.config("spark.sql.extensions", "delta.sql.DeltaSparkSessionExtensions").config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog").getOrCreate()
 
+factFile = spark.sql("SELECT * FROM SilverLH.factfile LIMIT 0")
 current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
 
 def get_all_files(directory):
@@ -1250,6 +1251,7 @@ class ETLModule_POS(POS):
                 self.remove_previous_data()
                 self.moveBlankFile()
                 self.move_file()
+                # self.post_ETL()
                 self.Logger.append("ETL process completed successfully.")
                 self.Logger.append("========================================================================================")
                 print('\n'.join(self.Logger))
@@ -1257,7 +1259,7 @@ class ETLModule_POS(POS):
 
             except Exception as e:
                 self.Logger.append(f"\t\tmain ETL process failed: {e}")
-                # self.move_to_badfile(self.FileNameList)
+                self.move_to_badfile(self.FileNameList)
                 self.addToFactFile(self.FILENAME_FILEKEY_mapper, -99)
                 self.Logger.append("========================================================================================")
                 return self
@@ -1265,10 +1267,9 @@ class ETLModule_POS(POS):
         except Exception as e:
             self.Logger.append(f"Load Staging process failed: {e}")
             try:
-                # self.move_to_badfile(self.FileNameList)
-                return self
+                self.move_to_badfile(self.FileNameList)
             except:
-                return self
+                pass
             # self.addToFactFile(2)
             self.Logger.append("========================================================================================")
             return self
@@ -1664,8 +1665,8 @@ class CashPickUp_DropDate:
                             ))
                         )
                     ).withColumn('YearMonth_DropDate', concat(
-                        substring(col('CheckTime').cast(StringType()), 1, 4),
-                        substring(col('CheckTime').cast(StringType()), 6, 2)).cast(IntegerType())
+                                substring(col('DropDate').cast(StringType()), 1, 4),
+                                substring(col('DropDate').cast(StringType()), 5, 2)).cast(IntegerType())
                     ).groupBy(
                         'StationKey',
                         'StationCode',
