@@ -268,3 +268,9 @@ def getSizeOnLake(tablePath):
     """).count()
 
     return numRow, numCol
+
+def get_lh_id(WS_ID, LH_name, case_sensitive = True):
+    if case_sensitive:
+        return notebookutils.lakehouse.get(LH_name,WS_ID)['id']
+    else:
+        return NotImplementedError(f'case_sensitive = {case_sensitive} is not implemented yet')

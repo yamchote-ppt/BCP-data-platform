@@ -15,7 +15,7 @@ import notebookutils
 import hashlib
 from tqdm import tqdm
 import time
-
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Dict, Any
 
 spark = SparkSession.builder.config("spark.sql.extensions", "delta.sql.DeltaSparkSessionExtensions").config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog").getOrCreate()
@@ -130,8 +130,12 @@ class LoadToFact_main(LoadToFact):
         self.Logger.append('\t\t\t\tdata type coversion and derived column process...')
 
         if self.SUBCATEGORY.upper() == 'TANKS':
-            self.dataConversion({'GradeNumber': StringType})
-            self.derivedField({'ReStationName': regexp_replace('StationName', ' ', '')})
+            if self.CATEGORY.upper() == 'FIRSTPRO':
+                self.dataConversion({'GradeNumber': StringType})
+                self.derivedField({'ReStationName': regexp_replace('StationName', ' ', '')})
+            elif self.CATEGORY.upper() == 'FLOWCO':
+                self.dataConversion({'GradeNumber': StringType})
+                self.derivedField({'ReStationName': regexp_replace('StationName', ' ', '')})
         elif self.SUBCATEGORY.upper() == 'METERS':
             self.dataConversion({'GradeNumber': StringType})
             self.derivedField({'ReStationName': regexp_replace('StationName', ' ', '')})
@@ -258,31 +262,22 @@ class LoadToFact_main(LoadToFact):
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct)
             matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'})
 
-        # after get stationkey
-        if (self.SUBCATEGORY.upper() in ['REFUND', 'POINTS', 'DISCOUNT', 'LUBE', 'PAYMENT']): # no lookup product
-            if self.SUBCATEGORY.upper() == 'PAYMENT':
-                if self.CATEGORY.upper() == 'FIRSTPRO':
-                    matchFinal = matchStation.withColumn('PAY_Time',col('PayTimeKey')).drop('PayTimeKey').withColumn('END_Time',col('END_TimeKey')).drop('END_TimeKey')
-                    UnMatchFinal = UnMatchStation
-                elif self.CATEGORY.upper() == 'FLOWCO':
-                    matchFinal = matchStation.withColumn('PAY_Date',lit(None)).withColumn('PAY_Time',lit(None)).withColumn('END_Date',lit(None)).withColumn('END_Time',lit(None))
-                    UnMatchFinal = UnMatchStation.withColumn('PAY_Date',lit(None)).withColumn('PAY_Time',lit(None)).withColumn('END_Date',lit(None)).withColumn('END_Time',lit(None))
-            else:
-                matchFinal, UnMatchFinal = matchStation, UnMatchStation
-
+        if (self.CATEGORY.upper() == 'FIRSTPRO' and self.SUBCATEGORY.upper() in ['REFUND', 'POINTS']) or (self.SUBCATEGORY.upper() in ['DISCOUNT', 'LUBE']):
+            matchFinal, UnMatchFinal = matchStation, UnMatchStation
+        
         elif self.SUBCATEGORY.upper() == 'FREE':
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                matchStation, UnMatchStation = matchStation.withColumns({"DeliveryId":lit(None)}), UnMatchStation.withColumns({"DeliveryId":lit(None)})
-                mappingProduct = mappingProduct.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'FREE')).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
-                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'FREE') & (col('StationKey').isNotNull())).select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
+                matchFinal, UnMatchFinal = matchStation.withColumns({"DeliveryId":lit(None)}), UnMatchStation.withColumns({"DeliveryId":lit(None)})
             elif self.CATEGORY.upper() == 'FLOWCO':
-                mappingProduct = mappingProduct.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'FREE')).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
-                mappingProductNoTitle = mappingProductNoTitle.filter((col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'FREE') & (col('StationKey').isNotNull())).select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
+                matchFinal, UnMatchFinal = matchStation, UnMatchStation
 
-            # matchFinal, UnMatchProduct = self.lookUpProduct(matchStation, SourceKey_key='Grade', SourceTitle_key='ReGradeTitle', StationKey_key='ReStationName', mappingProduct=mappingProduct, mappingProductNoTitle=mappingProductNoTitle)
-            matchFinal, UnMatchFinal = matchFinal, UnMatchProduct
-            # TODO: confirm what are denormalized
-        
+        elif self.SUBCATEGORY.upper() == 'PAYMENT':
+            if self.CATEGORY.upper() == 'FIRSTPRO':
+                matchFinal = matchStation.withColumn('PAY_Time',col('PayTimeKey')).drop('PayTimeKey').withColumn('END_Time',col('END_TimeKey')).drop('END_TimeKey')
+                UnMatchFinal = UnMatchStation
+            elif self.CATEGORY.upper() == 'FLOWCO':
+                matchFinal = matchStation.withColumn('PAY_Date',lit(None)).withColumn('PAY_Time',lit(None)).withColumn('END_Date',lit(None)).withColumn('END_Time',lit(None))
+                UnMatchFinal = UnMatchStation.withColumn('PAY_Date',lit(None)).withColumn('PAY_Time',lit(None)).withColumn('END_Date',lit(None)).withColumn('END_Time',lit(None))
 
         elif self.SUBCATEGORY.upper() == 'TRN':
             if self.CATEGORY.upper() == 'FIRSTPRO':
@@ -296,11 +291,11 @@ class LoadToFact_main(LoadToFact):
             UnMatchFinal = UnMatchStation.unionByName(UnMatchProduct).withColumn('YearKey',lit(None))
 
             if self.CATEGORY.upper() == 'FIRSTPRO':
-                match1 = matchFinal.filter(col('Volume')>=0).drop('Volume','Amount') # get only key of records whose volumn >= 0
+                match1 = matchFinal.filter(col('Volume')>=0).orderBy('FileKey','TransNumber','CloseDateKey').drop('Volume','Amount')
                 match2 = matchFinal.groupBy("CloseDateKey", "TransNumber", "FileKey").agg(
                     sum("Volume").alias("VOLUME"),
                     sum("Amount").alias("AMOUNT")  # Assuming 'Amount' is another column in your DataFrame
-                )
+                ).orderBy('FileKey','TransNumber','CloseDateKey')
                 matchFinal = match1.join(match2, on=['CloseDateKey', 'TransNumber', 'FileKey'], how='inner').withColumn('VOLUME',col('VOLUME').cast(DecimalType(15, 3)))
 
             matchFinal = matchFinal.withColumnsRenamed({'MappingKey':'ProductKey'}).withColumn('Vat',lit(None))
@@ -422,7 +417,6 @@ class LoadToFact_mismatch(LoadToFact):
                     'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
                     'ReStationName': regexp_replace('StationName', ' ', ''),
                     'ReGradeTitle': when((col('GradeTitle') == "") & (col('Volume') == 0) & (col('Amount') == 0), "LUBE").otherwise(col('GradeTitle')),
-                    'YearKey': floor(col('TransDateKey') / 10000),
                     'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False)
                 }
             )
@@ -913,41 +907,156 @@ class FactFileHandler:
         if not success:
             raise Exception("Failed to update LoadStatus in FactFile after 10 retries.")
         self.reload()
-        
-class POS:
-    dev = None
-    def __init__(self, config):
-        # TODO: make it independent from subcategory (move table name back to ETLModule_POS)
-        self.config = config
-        self.WS_ID = config["WS_ID"]
-        self.BronzeLH_ID = config["BronzeLH_ID"]
-        self.SilverLH_ID = config["SilverLH_ID"]
-        self.CATEGORY = config["CATEGORY"]
-        self.SUBCATEGORY = config["SUBCATEGORY"]
-        self.STAGING_TABLE_NAME = 'stagingPos'   + {'TRN':'Trn','PMT':'Payment','LUB':'Lube','AR_TRANSACTIONS':'AR','DSC':'Discount','EOD_METERS':'Meter','POINTS':'Points','REFUND':'Refund','EOD_TANKS':'Tank', 'FREE':'Free'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.FACT_TABLE_NAME    = 'factpos'      + {'TRN':'fuelsales','PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank', 'FREE':'free'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        self.MIS_TABLE_NAME     =  'mismatchpos' + {'TRN':'trn',  'PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank', 'FREE':'free'}.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
-        
-        
-        self.path_to_fact_table = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.FACT_TABLE_NAME}'
-        self.path_to_mismatch   = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.MIS_TABLE_NAME}'
-        self.path_to_staging    = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
-        self.mismatchTable = spark.read.load(self.path_to_mismatch)
-        self.stagingTable = spark.read.load(self.path_to_staging).limit(0)
-        self.stagingColumns = self.stagingTable.columns
-        self.factTable = spark.read.load(self.path_to_fact_table)
-        self.FactFileHandler = FactFileHandler(self.WS_ID,self.SilverLH_ID)
-        self.dev = config.get('dev',True)
-        self.log = {}
-        self.Logger = []
 
-    def truncate_staging(self):
-        tablePath = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
-        self.stagingSchema = spark.read.load(tablePath).limit(0)
-        empty_df = spark.createDataFrame([], schema=spark.read.format("delta").load(tablePath).schema)
-        empty_df.write.format("delta").mode("overwrite").save(tablePath)
-        return True
+class POS:
+    '''
+    This will be call at first to allocate the filekey of all nonblank raw file by adopt the code of reserved fileKey
+    '''
+    def __init__(self, WS_ID, BronzeLH_ID=None, SilverLH_ID=None):
+        self.WS_ID = WS_ID
+        self.BronzeLH_ID = BronzeLH_ID
+        self.SilverLH_ID = SilverLH_ID
+        self.BronzeLH_path = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}'
+        self.SilverLH_path = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}'
+
+        self.staging_suffix_mapper  = {'TRN':'Trn','PMT':'Payment','LUB':'Lube','AR_TRANSACTIONS':'AR','DSC':'Discount','EOD_METERS':'Meter','POINTS':'Points','REFUND':'Refund','EOD_TANKS':'Tank', 'FREE':'Free'}
+        self.fact_suffix_mapper     = {'TRN':'fuelsales','PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank', 'FREE':'free'}
+        self.mismatch_suffix_mapper = {'TRN':'trn',  'PMT':'payment','LUB':'lube','AR_TRANSACTIONS':'ar','DSC':'discount','EOD_METERS':'meter','POINTS':'points','REFUND':'refund','EOD_TANKS':'tank', 'FREE':'free'}
     
+        self.staging_columns = {
+            ('FIRSTPRO','TRN'): ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","Dispenser","Hose","Grade","GradeTitle","UnitPrice","Volume","Amount","AttendeeNumber","ChiefNumber"],
+            ('FLOWCO','TRN'):   ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","Dispenser","Hose","Grade","GradeTitle","UnitPrice","Volume","Amount","AttendeeNumber","ChiefNumber"],
+            ('FIRSTPRO','PMT'): ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","PMCode","ReceiveAmount","ARNumber","LPNumber","DocCode","PAY_Date","PAY_Time","End_Date","End_Time"],
+            ('FLOWCO','PMT'):   ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","PMCode","ReceiveAmount","ARNumber","LPNumber","DocCode"],
+            ('FIRSTPRO','LUB'):["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","LubeCode","LubeName","UnitPrice","Quantity","Amount"],
+            ('FLOWCO','LUB'):  ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","LubeCode","LubeName","UnitPrice","Quantity","Amount"],
+            ('FIRSTPRO','AR_TRANSACTIONS'): ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","Dispenser","Hose","GradeNumber","GradeTitle","GradePrice","Volume","Amount","LubeCode","UnitPrice","Quantity","LBAmount","PMCode","ARNumber","ARName","LicensePlate","DocCode","ODOMeter","AttendantNumber","DONumber"],
+            ('FLOWCO','AR_TRANSACTIONS'):   ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","Dispenser","Hose","GradeNumber","GradeTitle","GradePrice","Volume","Amount","LubeCode","UnitPrice","Quantity","LBAmount","PMCode","ARNumber","ARName","LicensePlate","DocCode","ODOMeter","AttendantNumber","DONumber"],
+            ('FIRSTPRO','DSC'): ["KeyId","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","DCCode","DCAmount"],
+            ('FLOWCO','DSC'): ["KeyId","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","DCCode","DCAmount"],
+            ('FIRSTPRO','EOD_METERS'): ["KeyId","CustomerCode","POSCode","StationName","CloseDateKey","TankNumber","DispenserNumber","HoseNumber","ShiftNumber","GradeNumber","GradeTitle","GradePrice","StartVolume","EndVolume","StartAmount","EndAmount","TestVolume","UsName"],
+            ('FLOWCO','EOD_METERS'):   ["KeyId","CustomerCode","POSCode","StationName","CloseDateKey","ShiftNumber","DispenserNumber","HoseNumber","TankNumber","GradeNumber","GradeTitle","GradePrice","StartVolume","EndVolume","StartAmount","EndAmount","TestVolume","UsName"],
+            ('FIRSTPRO','POINTS'): ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","PMCode","Terminal_ID","Merchant_Name","Batch_Number","Card_Trace_Number","Card_Number","Available_Balance","Collect_Point","Redeem_Point","Collect_TimeStemp"],
+            ('FIRSTPRO','REFUND'): ["KeyID","CustomerCode","POSCode","StationName","CloseDateKey","TransNumber","TransDateKey","TransTime","ReceiptNumber","Volume","Amount","Vat"],
+            ('FIRSTPRO','EOD_TANKS'):  ["KeyID","CustomerCode","POSCode","StationName","StartDateKey","TankNumber","GradeNumber","GradeTitle","OpenVolume","CloseVolume","DeliveryVolume","EndDateKey"],
+            ('FLOWCO','EOD_TANKS'):    ["KeyID","CustomerCode","POSCode","StationName","StartDateKey","TankNumber","GradeNumber","GradeTitle","OpenVolume","CloseVolume","DeliveryVolume","EndDateKey"],
+            ('FIRSTPRO','FREE'):   ['KeyID','CustomerCode','POSCode','StationName','EOD_Date','ReceiptNumber','TransDateKey','TransTime','TransNumber','FreeItemNo','FreeItemName','FreeQTY','FreeTopupQTY','FreeMemberQTY','FreeRemainQTY','ReceiptItemQTY','MemberCard','LoyaltyRedeemQTY','Rate','AccrualPoint','LoyaltyProductCode','LoyaltyProductName','Promotion'],
+            ('FLOWCO','FREE'):     ['KeyID','CustomerCode','POSCode','StationName','EOD_Date','ReceiptNumber','TransDateKey','TransTime','TransNumber','FreeItemNo','FreeItemName','FreeQTY','FreeTopupQTY','FreeMemberQTY','FreeRemainQTY','ReceiptItemQTY','MemberCard','LoyaltyRedeemQTY','Rate','AccrualPoint','LoyaltyProductCode','LoyaltyProductName','Promotion','DeliveryId']
+        }
+
+        self.RENAME_MAPPING = {'PMT':'PAYMENT',
+                    'LUB':'LUBE',
+                    'AR_TRANSACTIONS':'AR TRANSACTIONS',
+                    'DSC':'DISCOUNT',
+                    'EOD_METERS':'METERS',
+                    'EOD_TANKS':'TANKS'}
+        
+        self.lookupstation_key = {
+            ('FIRSTPRO','TRN'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','TRN'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','PMT'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','PMT'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','LUB'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','LUB'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','AR_TRANSACTIONS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','AR_TRANSACTIONS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','DSC'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','DSC'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','EOD_METERS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','EOD_METERS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','POINTS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','REFUND'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','EOD_TANKS'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','EOD_TANKS'): {'POSName_key': None, 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FIRSTPRO','FREE'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+            ('FLOWCO','FREE'): {'POSName_key':'ReStationName', 'POSCode_key':'POSCode', 'CustomerCode_key':'CustomerCode'},
+        }
+
+        self.lookupproduct_key = { # SourceKey_key: Any, SourceTitle_key: Any, StationKey_key: Any
+            ('FIRSTPRO','TRN'): {'SourceKey_key':'Grade', 'SourceTitle_key':'ReGradeTitle'},
+            ('FLOWCO','TRN'): {'SourceKey_key':'Grade', 'SourceTitle_key':'ReGradeTitle'},
+            ('FIRSTPRO','AR_TRANSACTIONS'): {'SourceKey_key':'GradeNumber', 'SourceTitle_key':'ReGradeTitle'},
+            ('FLOWCO','AR_TRANSACTIONS'): {'SourceKey_key':'GradeNumber', 'SourceTitle_key':'ReGradeTitle'},
+            ('FIRSTPRO','EOD_METERS'): {'SourceKey_key':'GradeNumber', 'SourceTitle_key':'GradeTitle'},
+            ('FLOWCO','EOD_METERS'): {'SourceKey_key':'GradeNumber', 'SourceTitle_key':'GradeTitle'},
+            ('FIRSTPRO','EOD_TANKS'): {'SourceKey_key':'GradeNumber', 'SourceTitle_key':'GradeTitle'},
+            ('FLOWCO','EOD_TANKS'): {'SourceKey_key': 'GradeNumber', 'SourceTitle_key':'GradeTitle'},
+            # ('FIRSTPRO','FREE'): {'SourceKey_key':'', 'SourceTitle_key':''},
+            # ('FLOWCO','FREE'): {'SourceKey_key':'', 'SourceTitle_key':''},
+        }
+        
+        self.lookupproduct_no_title_key = {
+            ('FIRSTPRO','TRN'): {'SourceKey_key':'Grade', 'StationKey_key':'StationKey'},
+            ('FLOWCO','TRN'): {'SourceKey_key':'Grade', 'StationKey_key':'StationKey'},
+            ('FIRSTPRO','AR_TRANSACTIONS'): {'SourceKey_key':'GradeNumber', 'StationKey_key':'StationKey'},
+            ('FLOWCO','AR_TRANSACTIONS'): {'SourceKey_key':'GradeNumber', 'StationKey_key':'StationKey'},
+            ('FIRSTPRO','EOD_METERS'): {'SourceKey_key':'GradeNumber', 'StationKey_key':'StationKey'},
+            ('FLOWCO','EOD_METERS'): {'SourceKey_key':'GradeNumber', 'StationKey_key':'StationKey'},
+            ('FIRSTPRO','EOD_TANKS'): {'SourceKey_key':'GradeNumber', 'StationKey_key':'StationKey'},
+            # ('FIRSTPRO','FREE'): {'SourceKey_key':'', 'StationKey_key':''},
+            # ('FLOWCO','FREE'): {'SourceKey_key':'', 'StationKey_key':''},
+        }
+
+        self.sourcefile_mapping = {
+            'TRN': 'TRANSACTION', 'EOD_METERS':'METERS', 'AR_TRANSACTIONS':'AR', 'EOD_TANKS':'TANKS'
+        }
+
+        self.sourcefile_no_title_mapping = {
+            'TRN': 'TRANSACTION', 'EOD_METERS':'METERS', 'AR_TRANSACTIONS':'TRANSACTION', 'EOD_TANKS':'TANKS'
+        }
+
+        self.add_condition_no_title_mapping = {
+            ('FIRSTPRO', 'TRN'): (col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()),
+            ('FLOWCO', 'TRN'): (col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()),
+            ('FIRSTPRO', 'EOD_METERS'): (col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'METERS') & (col('sourcetitle').isNull()),
+            ('FLOWCO', 'EOD_METERS'): (col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'METERS') & (col('StationKey').isNotNull()),
+            ('FIRSTPRO', 'AR_TRANSACTIONS'): (col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()),
+            ('FLOWCO', 'AR_TRANSACTIONS'): (col('sourcename') == 'FLOWCO') & (col('sourcefile') == 'TRANSACTION') & (col('StationKey').isNotNull()),
+            ('FIRSTPRO', 'EOD_TANKS'): (col('sourcename') == 'FIRSTPRO') & (col('sourcefile') == 'TANKS') & (col('StationKey').isNotNull())
+        }
+
+        self.mappingkey_rename = {
+            'TANKS': {'MappingKey':'ProductKey'},
+            'TRN': {'MappingKey':'ProductKey'},
+            'EOD_METERS': {'MappingKey':'ProductKey'},
+            'AR_TRANSACTIONS': {'MappingKey':'GradeKey','LBAmount':'LubeAmount','AttendantNumber':'AttendeeNumber'},
+        }
+
+        self.log = {}
+
+    def allocate_filekey(self):
+        current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
+
+        try:
+            df = spark.read.format('csv').option("encoding", "TIS-620").load(f'{self.BronzeLH_path}/Files/Ingest/POS/*/*')\
+                            .withColumn("FilePath", input_file_name()).select('FilePath').drop_duplicates() \
+                            .withColumn("FileName", regexp_replace(regexp_extract("FilePath", r".*/([^/?]+)", 1), "%23", "#"))\
+                            .withColumn("cat_subcat",regexp_extract("FilePath", r".*/[\d\%]+([^/?]+)\.CSV", 1))\
+                            .withColumn("CategoryName", when(col("cat_subcat").contains("FLOWCO"), "FLOWCO").otherwise("FIRSTPRO"))\
+                            .withColumn("SubCategoryName", when(col("cat_subcat").contains("FLOWCO"), regexp_extract("cat_subcat", r"(.*)FLOWCO", 1)).otherwise(col("cat_subcat")))\
+                            .filter(col('SubCategoryName')!='CPU')\
+                            .withColumn("LoadDateKey", lit(current_date_list[0])).withColumn("LoadTimeKey", lit(current_date_list[1]))\
+                            .withColumn('LoadStatus', lit(None).cast(ShortType())).cache()
+        except:
+            df = None
+
+        if df is not None:
+            df = df.replace(self.RENAME_MAPPING, subset=["SubCategoryName"])
+
+            window_spec = Window.orderBy(col("FileName").asc())
+            path_to_factfile = f'{self.SilverLH_path}/Tables/factfile'
+            factFile = spark.read.load(path_to_factfile)
+            LastId = factFile.agg(max('FileKey').alias('maxFileKey')).collect()[0].maxFileKey if factFile.agg(max('FileKey').alias('maxFileKey')).collect()[0].maxFileKey else 0
+            df = df.withColumn('FileKey', dense_rank().over(window_spec) + LastId).select('FileKey','FileName','CategoryName','SubCategoryName','LoadDateKey','LoadTimeKey','LoadStatus')
+
+            df.write.mode('append').partitionBy(['SubCategoryName', 'CategoryName', 'LoadStatus']).save(path_to_factfile)
+
+            self.log['count_df'] = df.groupBy(['CategoryName','SubCategoryName']).count()
+            self.reservedFileKey = df.select('FileKey').collect()
+            return self.reservedFileKey
+        else:
+            return None
+        
     def updateFactFile_in_remove_previous_all(self,rows_to_delete):
         self.Logger.append('updateFactFile_in_remove_previous')
         rows_to_update = rows_to_delete.filter((col('LoadStatus').isin([1,3,5,-99]))|(col('LoadStatus').isNull())).select("FileKey").collect()
@@ -985,24 +1094,550 @@ class POS:
         self.Logger.append('post_ETL complete')
         print('\n'.join(self.Logger))
 
+    def dataConversion(self, stagingTable, ColumnsCast: Dict[str, Any]):
+        stagingTable = stagingTable.withColumns(
+            {column: col(column).cast(ColumnsCast[column]()) for column in ColumnsCast}
+        )
+        return stagingTable
+
+    def derivedField(self, stagingTable, ColumnsExpr: Dict[str, Any]):
+        stagingTable = stagingTable.withColumns(
+            {column: ColumnsExpr[column] for column in ColumnsExpr}
+        )
+        return stagingTable
+
+    def addFileNameToStagingTable(self, stagingTable, factFile):
+        self.Logger.append('\t\t\tAdding Filname from factfile by FileKey')
+        stagingTable = stagingTable.join(factFile.select('FileKey','FileName'), on='FileKey', how='left')
+        return stagingTable
+    
+class POS_to_staging(POS):
+    '''
+    Expected all file in this state have thier own FileKey in FactFile whose `LoadStatus = lit(None)`
+    '''
+    dev = None
+    def __init__(self, WS_ID, BronzeLH_ID, SilverLH_ID, SUBCATEGORY):
+        # TODO: make it independent from category (move table name back to ETLModule_POS)
+        super().__init__(
+            WS_ID = WS_ID,
+            BronzeLH_ID = BronzeLH_ID,
+            SilverLH_ID = SilverLH_ID
+            )
+        
+        # self.CATEGORY = config["CATEGORY"] # read both FIRSTPRO and FLOWCO in the same time like mismatch does
+        self.SUBCATEGORY = SUBCATEGORY
+        self.STAGING_TABLE_NAME = 'stagingPos'   + self.staging_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        # self.FACT_TABLE_NAME    = 'factpos'      + self.fact_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        # self.MIS_TABLE_NAME     = 'mismatchpos' + self.mismatch_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        
+        self.path_to_staging    = f'{self.BronzeLH_path}/Tables/{self.STAGING_TABLE_NAME}'
+        self.path_to_factfile    = f'{self.SilverLH_path}/Tables/factfile'
+        self.LoadedStagingDir = f'{self.BronzeLH_path}/Files/LoadedStaging/'
+        self.BadFilesDir =  f'{self.BronzeLH_path}/Files/BadFiles/'
+
+        if not notebookutils.fs.exists(f'{self.LoadedStagingDir}/POS'):
+            notebookutils.fs.mkdirs(f'{self.LoadedStagingDir}/POS')
+        if not notebookutils.fs.exists(f'{self.BadFilesDir}/POS'):
+            notebookutils.fs.mkdirs(f'{self.BadFilesDir}/POS')
+
+        self.stagingTable = spark.read.load(self.path_to_staging)
+        self.stagingColumns = self.stagingTable.columns
+
+        self.FactFileHandler = FactFileHandler(self.WS_ID,self.SilverLH_ID)
+        self.stagingSchema = spark.read.load(self.path_to_staging).limit(0)
+        self.log = {}
+        self.Logger = []
+
+    # def truncate_staging(self):
+    #     tablePath = f'{self.BronzeLH_path}/Tables/{self.STAGING_TABLE_NAME}'
+    #     empty_df = spark.createDataFrame([], schema=spark.read.format("delta").load(tablePath).schema)
+    #     empty_df.write.format("delta").mode("overwrite").save(tablePath)
+    #     return True
+    
+    def addFileKeyToStaging(self, df):
+        factfile = spark.read.load(self.path_to_factfile).filter((col('SubCategoryName')==self.RENAME_MAPPING.get(self.SUBCATEGORY,self.SUBCATEGORY))&(col('LoadStatus').isNull()))
+        window_spec = Window.partitionBy("FileName").orderBy(col("FileKey").desc())
+        tmpFactFile = factfile.withColumn("RowNum", row_number().over(window_spec))
+        lookUpFileKey = tmpFactFile.filter(col('RowNum')==1).select('FileName','FileKey').withColumn('FileKey',col('FileKey').cast(IntegerType()))
+        df = df.join(lookUpFileKey, on='FileName', how='left')
+        return df
+
+    def readFilePos(self, file_path, columns):
+        current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
+
+        df = spark.read.format("csv") \
+            .option("encoding", "TIS-620").option("delimiter", "|") \
+            .load(file_path)
+            
+        if df.count() != 0:
+            df = df.toDF(*columns) \
+                .withColumn("FilePath", input_file_name()) \
+                .withColumn("FileName", regexp_replace(regexp_extract("FilePath", r".*/([^/?]+)", 1), "%23", "#"))\
+                .withColumn("LoadDateKey", lit(current_date_list[0])).withColumn("LoadTimeKey", lit(current_date_list[1]))
+        else:
+            df = self.stagingSchema\
+                .withColumn("FilePath", input_file_name()) \
+                .withColumn("FileName", regexp_replace(regexp_extract("FilePath", r".*/([^/?]+)", 1), "%23", "#"))\
+                .withColumn("LoadDateKey", lit(current_date_list[0])).withColumn("LoadTimeKey", lit(current_date_list[1]))
+        return df.drop('FilePath')
+    
+    def readRawFiles(self):
+        dfs = []
+        dfs.append(self.readFilePos(f'{self.BronzeLH_path}/Files/Ingest/POS/FIRSTPRO/{self.SUBCATEGORY}/', self.staging_columns[('FIRSTPRO',self.SUBCATEGORY)]))
+        if self.SUBCATEGORY not in ['REFUND','POINTS']:
+            dfs.append(self.readFilePos(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/', self.staging_columns[('FLOWCO',self.SUBCATEGORY)]))
+        
+        df = spark.read.load(self.path_to_staging).drop('FileKey').limit(0)
+        for d in dfs:
+            df = df.unionByName(d,allowMissingColumns=True)
+
+        df = self.addFileKeyToStaging(df)
+        df = utils.copySchemaByName(df,self.stagingSchema)
+        return df # already have fileKey
+    
+    def move_to_loadedstaging(self):
+        notebookutils.fs.mkdirs(f'{self.LoadedStagingDir}/POS/FIRSTPRO/{self.SUBCATEGORY}/')
+        notebookutils.fs.mv(f'{self.BronzeLH_path}/Files/Ingest/POS/FIRSTPRO/{self.SUBCATEGORY}/', f'{self.LoadedStagingDir}/POS/FIRSTPRO/',create_path=True,overwrite=True)
+        notebookutils.fs.mkdirs(f'{self.BronzeLH_path}/Files/Ingest/POS/FIRSTPRO/{self.SUBCATEGORY}/')
+
+        if self.SUBCATEGORY not in ['REFUND','POINTS']:
+            notebookutils.fs.mkdirs(f'{self.LoadedStagingDir}/POS/FLOWCO/{self.SUBCATEGORY}/')
+            notebookutils.fs.mv(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/', f'{self.LoadedStagingDir}/POS/FLOWCO/',create_path=True,overwrite=True)
+            notebookutils.fs.mkdirs(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/')
+
+    def move_to_badfiles(self):
+        notebookutils.fs.mkdirs(f'{self.BadFilesDir}/POS/FIRSTPRO/{self.SUBCATEGORY}/')
+        notebookutils.fs.mv(f'{self.BronzeLH_path}/Files/Ingest/POS/FIRSTPRO/{self.SUBCATEGORY}/', f'{self.BadFilesDir}/POS/FIRSTPRO/',create_path=True,overwrite=True)
+        notebookutils.fs.mkdirs(f'{self.BronzeLH_path}/Files/Ingest/POS/FIRSTPRO/{self.SUBCATEGORY}/')
+
+        if self.SUBCATEGORY not in ['REFUND','POINTS']:
+            notebookutils.fs.mkdirs(f'{self.BadFilesDir}/POS/FLOWCO/{self.SUBCATEGORY}/')
+            notebookutils.fs.mv(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/', f'{self.BadFilesDir}/POS/FLOWCO/',create_path=True,overwrite=True)
+            notebookutils.fs.mkdirs(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/')
+
+    def fromRawToStaging(self):
+        try:
+            # self.truncate_staging()
+            self.stagingTable = self.readRawFiles()
+            self.stagingTable.select(*set(self.stagingSchema.columns + ['LoadDateKey', 'LoadTimeKey', "FileName"])).write.mode('overwrite').option("overwriteSchema", "true").save(self.path_to_staging)
+            self.move_to_loadedstaging() # Ingest -> LoadedStaging
+            self.STATUS = 'Save to staging succeed'
+            return self
+        except Exception as e:
+            self.move_to_badfiles() # Ingest -> badfiles
+            return self
+    
+    def fromRawToStaging_no_catch(self):
+        # self.truncate_staging()
+        self.stagingTable = self.readRawFiles()
+        self.stagingTable.select(*set(self.stagingSchema.columns + ['LoadDateKey', 'LoadTimeKey', "FileName"])).write.mode('overwrite').option("overwriteSchema", "true").save(self.path_to_staging)
+        self.move_to_loadedstaging() # Ingest -> LoadedStaging
+        self.STATUS = 'Save to staging succeed'
+        return self
+        
+class POS_to_staging_all(POS):
+    def __init__(self, config):
+        self.config = config
+        super().__init__(
+            WS_ID = config["WS_ID"],
+            BronzeLH_ID = config["BronzeLH_ID"],
+            SilverLH_ID = config["SilverLH_ID"]
+            )
+        self.SUBCATEGORIES = config.get('SUBCATEGORIES', ['AR_TRANSACTIONS', 'DSC', 'EOD_METERS','EOD_TANKS','LUB','PMT','POINTS','REFUND','TRN'])
+        assert isinstance(self.SUBCATEGORIES, list), 'SUBCATEGORIES should be a list'
+
+    def create_pos_to_staging(self, SUBCATEGORY):
+        load_obj = POS_to_staging(self.WS_ID, self.BronzeLH_ID, self.SilverLH_ID, SUBCATEGORY)
+        s = load_obj.fromRawToStaging()
+        return s
+    
+    def run_load_to_staging(self):
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            self.futures = {SUBCATEGORY: executor.submit(self.create_pos_to_staging, SUBCATEGORY) for SUBCATEGORY in self.SUBCATEGORIES}
+
+class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer staging contains both FIRSTPRO and FLOWCO at the same time
+    def __init__(self, config):
+        super().__init__(
+            WS_ID = config["WS_ID"],
+            BronzeLH_ID = config["BronzeLH_ID"],
+            SilverLH_ID = config["SilverLH_ID"]
+            )
+        self.SUBCATEGORY = config["SUBCATEGORY"]
+        self.STAGING_TABLE_NAME = 'stagingPos'   + self.staging_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        self.FACT_TABLE_NAME    = 'factpos'      + self.fact_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        self.MIS_TABLE_NAME     = 'mismatchpos' + self.mismatch_suffix_mapper.get(self.SUBCATEGORY,TypeError('NOT CORRECT SUBCATEGORY'))
+        
+        self.path_to_staging    = f'{self.BronzeLH_path}/Tables/{self.STAGING_TABLE_NAME}'
+        self.path_to_factfile   = f'{self.SilverLH_path}/Tables/factfile'
+        self.path_to_mismatch   = f'{self.SilverLH_path}/Tables/{self.MIS_TABLE_NAME}'
+        self.path_to_fact      = f'{self.SilverLH_path}/Tables/{self.FACT_TABLE_NAME}'
+
+        self.pre_transform_map = {
+            'EOD_TANKS': self.pre_transform_TANKS,
+            'EOD_METERS': self.pre_transform_METERS,
+            'TRN': self.pre_transform_TRN,
+            'PMT': self.pre_transform_PMT,
+            'LUB': self.pre_transform_LUB,
+            'AR_TRANSACTIONS': self.pre_transform_AR,
+            'DSC': self.pre_transform_DSC,
+            'POINTS':self.pre_transform_PMT,
+            'REFUND':self.pre_transform_REFUND
+        }
+
+    def load_staging_table(self):
+        return spark.read.load(self.path_to_staging)
+
+    def add_category_column(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'IsFlowCo': when(instr(col('FileName'), 'FLOWCO') > 0, True).otherwise(False),
+            })
+        return stagingTable 
+
+    def pre_transform_TANKS(self, stagingTable):
+        stagingTable = self.dataConversion(stagingTable, {'GradeNumber': StringType})
+        stagingTable = self.derivedField(stagingTable, {
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        return stagingTable
+    
+    def pre_transform_METERS(self, stagingTable):
+        stagingTable = self.dataConversion(stagingTable, {'GradeNumber': StringType})
+        stagingTable = self.derivedField(stagingTable, {
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+        return stagingTable
+    
+    def pre_transform_TRN(self, stagingTable):
+        stagingTable = self.dataConversion(stagingTable, {'Grade': StringType})
+        stagingTable = self.derivedField(stagingTable, {
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+                'ReGradeTitle': when((col('GradeTitle') == "") & (col('Volume') == 0) & (col('Amount') == 0), "LUBE").otherwise(col('GradeTitle')),
+                'YearKey': floor(col('TransDateKey') / 10000),
+            })
+        return stagingTable
+    
+    def pre_transform_PMT(self, stagingTable):
+
+        stagingTable_flowco = stagingTable.filter(col('IsFlowCo')==True).cache()
+        stagingTable_firstpro = stagingTable.filter(col('IsFlowCo')==False).cache()
+
+        stagingTable_firstpro = self.derivedField(stagingTable_firstpro,{
+                    'PAY_Time': when(length(col('PAY_Time')) > 1, col('PAY_Time')).otherwise("999999"),
+                    'End_Time': when(length(col('End_Time')) > 1, concat(regexp_replace('End_Time', ':', ''), lit('00'))).otherwise("999999"),
+                    'PAY_Date': when(length(col('PAY_Date')) > 1, col('PAY_Date')).otherwise("00000000"),
+                    'End_Date': when(length(col('End_Date')) > 1, col('End_Date')).otherwise("00000000"),
+                    'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                    'ReStationName': regexp_replace('StationName', ' ', ''),
+                })
+        stagingTable_firstpro = self.derivedField(stagingTable_firstpro,{
+                    'PayTimeKey': regexp_replace('PAY_Time', ':', '')
+                })
+        stagingTable_firstpro = self.derivedField(stagingTable_firstpro,{
+                    'End_Time': when(length(col('End_Time')) > 1, col('End_Time')).otherwise("99999999"),
+                    'PAY_Date': when(length(col('PAY_Date')) > 1, col('PAY_Date')).otherwise("00000000"),
+                    'PAY_Time': when(length(col('PAY_Time')) > 1, col('PAY_Time')).otherwise("99999999"),
+                    'End_Date': when(length(col('End_Date')) > 1, col('End_Date')).otherwise("00000000"),
+                })
+        stagingTable_firstpro = self.derivedField(stagingTable_firstpro,{
+                    'Pay_TimeKey': col('PayTimeKey').cast(IntegerType()),
+                    'END_TimeKey': col('End_Time').cast(IntegerType())
+                })
+        
+        stagingTable_flowco = self.derivedField(stagingTable_flowco, {
+                    'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                    'ReStationName': regexp_replace('StationName', ' ', '')
+                })
+
+        stagingTable = stagingTable_firstpro.unionByName(stagingTable_flowco,allowMissingColumns=True)
+        return stagingTable
+    
+    def pre_transform_LUB(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00'))
+            })
+        return stagingTable
+    
+    def pre_transform_AR(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'GradeNumber': coalesce(col('GradeNumber'),lit(0)).cast(StringType()),
+                'GradeTitle': coalesce(col('GradeTitle'),lit('')),
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'CastLubeCode': when(col('LubeCode') == "", "0").otherwise(col('LubeCode')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+                'ReGradeTitle': when((col('GradeTitle') == "") & (col('Volume').cast(ShortType()) == 0) & (col('Amount').cast(ShortType()) == 0), "LUBE").otherwise(col('GradeTitle'))
+            })
+        return stagingTable
+    
+    def pre_transform_DSC(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+    
+    def pre_transform_POINTS(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+                'Collect_Date': substring(col('Collect_TimeStemp'), 1, 8),
+                'Collect_Time': trim(substring_index(col('Collect_TimeStemp'), ' ', -1)),
+                'YearKey': floor(col('TransDateKey') / 10000)
+            })
+        
+    def pre_transform_REFUND(self, stagingTable):
+        stagingTable = self.derivedField(stagingTable, {
+                'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
+                'ReStationName': regexp_replace('StationName', ' ', ''),
+            })
+
+    def pre_transform(self, stagingTable, SUBCATEGORY):
+        stagingTable = self.add_category_column(stagingTable)
+        pre_transform_func = self.pre_transform_map[SUBCATEGORY]
+        stagingTable = pre_transform_func(stagingTable)
+        return stagingTable
+
+    def look_up_stationKey(self, stagingTable, dimstation, POSName_key, POSCode_key, CustomerCode_key):
+        if POSName_key:
+            self.dimStation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
+                                .select(col('StationKey'),col('CustomerCode'),col('POSCode'),regexp_replace(col('PosName'), ' ', '').alias('POSName')).drop_duplicates()
+            
+            incomingDF = stagingTable.withColumns({'key1':col(POSName_key),'key2':col(POSCode_key),'key3':col(CustomerCode_key)})
+            dimstationjoin = dimstation.withColumnsRenamed({'POSName':'key1','POSCode':'key2','CustomerCode':'key3'})
+            lookupCondition = ['key1','key2','key3']
+
+            matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2','key3')
+            UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2','key3').withColumn('StationKey',lit(None).cast(IntegerType()))
+            assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
+            return matchStation, UnMatchStation
+        else:
+            self.dimStation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
+                                .select(col('StationKey'),col('CustomerCode'),col('POSCode')).drop_duplicates()
+            
+            incomingDF = stagingTable.withColumns({'key1':col(POSCode_key),'key2':col(CustomerCode_key)})
+            dimstationjoin = stagingTable.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
+            lookupCondition = ['key1','key2']
+
+            matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2')
+            UnMatchStation  = incomingDF.join(dimstationjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch StationKey")).drop('key1','key2').withColumn('StationKey',lit(None).cast(IntegerType()))
+            assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
+            return matchStation, UnMatchStation
+        
+    def getMappingProduct(self, CATEGORY, SUBCATEGORY):
+        if SUBCATEGORY not in self.sourcefile_mapping.keys():
+            return None
+        else:
+            mappingProduct = spark.read.load(f'{self.SilverLH_path}/Tables/mappingproduct')
+            mappingProduct = mappingProduct.filter((col('sourcename') == CATEGORY) & (col('sourcefile') == self.sourcefile_mapping[SUBCATEGORY])).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
+            mappingProduct = utils.trim_string_columns(mappingProduct)
+            return mappingProduct
+    
+    def getMappingProductNoTitle(self, CATEGORY, SUBCATEGORY):
+        if (CATEGORY, SUBCATEGORY) not in self.add_condition_no_title_mapping.keys():
+            return None
+        else:
+            mappingProductNoTitle = spark.read.load(f'{self.SilverLH_path}/Tables/mappingproduct')
+            mappingProductNoTitle = mappingProductNoTitle.filter(self.add_condition_no_title_mapping[(CATEGORY, SUBCATEGORY)]).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
+            mappingProductNoTitle = utils.trim_string_columns(mappingProductNoTitle)
+            return mappingProductNoTitle
+    
+    @staticmethod
+    def _look_up_product(incomingDF, mappingProduct, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key):
+        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(SourceTitle_key)})
+        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'})
+        lookupCondition = ['key1','key2']
+        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
+        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
+        if SUBCATEGORY == 'EOD_TANKS' and CATEGORY == 'FLOWCO':
+            UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0))
+        return matchProduct, UnMatchProduct
+
+    def look_up_product(self, incomingDF, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key):
+        mappingProduct = self.getMappingProduct(CATEGORY, SUBCATEGORY)
+        if mappingProduct is None:
+            return (None, None)
+        else:
+            matchProduct, UnMatchProduct = self._look_up_product(incomingDF, mappingProduct, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key)
+            return matchProduct, UnMatchProduct
+
+    @staticmethod
+    def _look_up_product_no_title(incomingDF,mappingProductNoTitle, SourceKey_key, StationKey_key):
+        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(StationKey_key)})
+        mappingProductjoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key2'})
+        lookupCondition = ['key1','key2']
+        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
+        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProductNoTitle: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
+        return matchProduct, UnMatchProduct
+
+    def look_up_product_no_title(self, incomingDF, CATEGORY, SUBCATEGORY, SourceKey_key, StationKey_key):
+        mappingProductNoTitle = self.getMappingProductNoTitle(CATEGORY, SUBCATEGORY)
+        if mappingProductNoTitle is None:
+            return (None, None)
+        else:
+            matchProduct, UnMatchProduct = self._look_up_product_no_title(incomingDF, mappingProductNoTitle, SourceKey_key, StationKey_key)
+            return matchProduct, UnMatchProduct
+
+class POS_ETL(POS_load_to_fact):
+    def __init__(self,config):
+        super().__init__(config)
+
+    # FIRSTPRO
+    def FIRSTPRO(self, stagingTable_firstpro):
+        if stagingTable_firstpro.count() > 0:
+            match_station_table_firstpro, not_match_station_table_firstpro = self.look_up_stationKey(stagingTable_firstpro, **self.lookupstation_key[('FIRSTPRO', self.SUBCATEGORY)])
+            match_product, not_match_product = self.look_up_product(incomingDF = match_station_table_firstpro, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key[('FIRSTPRO', self.SUBCATEGORY)])
+            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key[('FIRSTPRO', self.SUBCATEGORY)])
+            match_table = match_product_no_title
+
+            mismatch_table = not_match_station_table_firstpro
+            if not_match_product:
+                mismatch_table = mismatch_table.unionByName(not_match_product,allowMissingColumns=True)
+            if not_match_product_no_title:  
+                mismatch_table = mismatch_table.unionByName(not_match_product_no_title,allowMissingColumns=True)
+
+            return (match_table, mismatch_table)
+        else:
+            return (None, None)
+
+    def FLOWCO(self, stagingTable_flowco):
+        if stagingTable_flowco.count() > 0:
+            match_staion_table_flowco, not_match_staion_table_flowco = self.look_up_stationKey(stagingTable_flowco, **self.lookupstation_key[('FLOWCO', self.SUBCATEGORY)])
+            match_product, not_match_product = self.look_up_product(incomingDF = match_staion_table_flowco, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key[('FLOWCO', self.SUBCATEGORY)])
+            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key[('FLOWCO', self.SUBCATEGORY)])
+            match_table = match_product_no_title
+
+            mismatch_table = not_match_staion_table_flowco
+            if not_match_product:
+                mismatch_table = mismatch_table.unionByName(not_match_product,allowMissingColumns=True)
+            if not_match_product_no_title:  
+                mismatch_table = mismatch_table.unionByName(not_match_product_no_title,allowMissingColumns=True)
+
+            return (match_table, mismatch_table)
+        else:
+            return (None, None)
+        
+    def run_lookup(self, stagingTable_firstpro, stagingTable_flowco):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future1 = executor.submit(self.FIRSTPRO, stagingTable_firstpro)
+            future2 = executor.submit(self.FLOWCO, stagingTable_flowco)
+
+            match_firstpro, mismatch_firstpro = future1.result()
+            match_flowco, mismatch_flowco = future2.result()
+
+            match_result = [x for x in [match_firstpro, match_flowco] if x is not None]
+            mismatch_result = [x for x in [mismatch_firstpro, mismatch_flowco] if x is not None]
+
+        if len(match_result) > 0:
+            match_table = match_result[0]
+            for i in range(1, len(match_result)):
+                match_table = match_table.unionByName(match_result[i], allowMissingColumns=True)
+        else:
+            match_table = None
+
+        if len(mismatch_result) > 0:
+            mismatch_table = mismatch_result[0]
+            for i in range(1, len(mismatch_result)):
+                mismatch_table = mismatch_table.unionByName(mismatch_result[i], allowMissingColumns=True)
+        else:
+            mismatch_table = None
+
+        return match_table, mismatch_table
+    
+    def rename_mappingKey(self, match_table):
+        if self.SUBCATEGORY in self.mappingkey_rename.keys():
+            match_table = match_table.withColumnsRenamed(self.mappingkey_rename[self.SUBCATEGORY])
+        return match_table
+
+    def saveMatchTable(self,match_table,path_to_save):
+        facttable = spark.read.load(path_to_save)
+        match_table = utils.copySchemaByName(match_table, facttable).select(facttable.columns)
+        match_table.write.mode('append').save(path_to_save)
+
+    def saveMisMatchTable(self, mismatch_table, path_to_save):
+        mismatchtable = spark.read.load(path_to_save)
+        mismatch_table = utils.copySchemaByName(mismatch_table, mismatchtable).select(mismatchtable.columns)
+        mismatch_table.write.mode('append').save(path_to_save)
+
+    def remove_previous_data(self, comingFileName):
+        # ต้องลบแค่ใน fact table กับ mismatch ก่อน แล้วเก็บไปอัพเดต LoadStatus ใน factfile ทีเดียวพร้อมกันกับตัวอื่น ไม่งั้นจะ concurrency conflict
+        factfile = spark.read.load(self.path_to_factfile)
+
+        fact_table = spark.read.load(self.path_to_fact)
+        fact_table = fact_table.join(factfile.select('FileKey', 'FileName'), on='FileKey', how='left')
+        remove_filekey_fact = fact_table.select('FileKey', 'FileName').join(factfile.select('FileKey', 'FileName'), on='FileName', how='inner').select('FileKey').distinct()
+        new_fact_table = fact_table.join(comingFileName, on='FileName', how='left_anti').drop('FileName')
+        new_fact_table.write.mode('overwrite').save(self.path_to_fact)
+
+        mismatch_table = spark.read.load(self.path_to_mismatch)
+        mismatch_table = mismatch_table.join(factfile.select('FileKey', 'FileName'), on='FileKey', how='left')
+        remove_filekey_mismatch = mismatch_table.select('FileKey', 'FileName').join(factfile.select('FileKey', 'FileName'), on='FileName', how='inner').select('FileKey').distinct()
+        new_mismatch_table = mismatch_table.join(comingFileName, on='FileName', how='left_anti').drop('FileName')
+        new_mismatch_table.write.mode('overwrite').save(self.path_to_mismatch)
+
+        remove_filekey = remove_filekey_fact.unionByName(remove_filekey_mismatch, allowMissingColumns=True).distinct() # for update LoadStatus = 4 in the last step together with other subcategory
+        return remove_filekey
+        
+    def run_etl(self):
+        self.stagingTable = self.load_staging_table()
+        assert "FileName" in self.stagingTable.columns, f"FileName column not found in staging table {self.STAGING_TABLE_NAME}"
+        self.comingFileName = self.stagingTable.select('FileName').distinct().cache()
+        self.remove_filekey = self.remove_previous_data(self.comingFileName) # now same file records is removed from fact and mismatch table
+
+        self.stagingTable = self.pre_transform(self.stagingTable, self.SUBCATEGORY)
+        self.stagingTable_firstpro = self.stagingTable.filter(~col('IsFlowCo')).cache()
+        self.stagingTable_flowco = self.stagingTable.filter(col('IsFlowCo')).cache()
+        self.match_table, self.mismatch_table = self.run_lookup(self.stagingTable_firstpro, self.stagingTable_flowco)
+        self.match_table = self.rename_mappingKey(self.match_table)
+        self.saveMatchTable(self.match_table, self.path_to_fact)
+        self.saveMisMatchTable(self.mismatch_table, self.path_to_mismatch)
+
+
+
+        return self # จะเอา self.remove_filekey ไปใช้ใน factfile update
+
+class POS_mismatch(POS_load_to_fact):
+    pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class ETLModule_POS(POS):
     dev = None
     def __init__(self, config):
         # assert , keys in config, 'Missing keys in config'
         super().__init__(config)
-        today_date = (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d')
         self.FILE_PATH_ON_LAKE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Ingest/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
-        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{today_date}/'
-        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{today_date}/'
-        self.BlankdDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BlankFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/{today_date}/'
-        MAPPING = {
-            'PMT':'PAYMENT',
-            'LUB':'LUBE',
-            'AR_TRANSACTIONS':'AR TRANSACTIONS',
-            'DSC':'DISCOUNT',
-            'EOD_METERS':'METERS',
-            'EOD_TANKS':'TANKS'
-            }
+        self.BadFilesDir =  f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BadFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.ProcessedDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/Processed/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        self.BlankdDir = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Files/BlankFiles/POS/{self.CATEGORY}/{self.SUBCATEGORY}/'
+        MAPPING = {'PMT':'PAYMENT',
+                    'LUB':'LUBE',
+                    'AR_TRANSACTIONS':'AR TRANSACTIONS',
+                    'DSC':'DISCOUNT',
+                    'EOD_METERS':'METERS',
+                    'EOD_TANKS':'TANKS'}
         config['SUBCATEGORY'] = MAPPING.get(config['SUBCATEGORY'],config['SUBCATEGORY'])
         self.SUBCATEGORY = config['SUBCATEGORY']
         self.list_Processed_file = self.FactFileHandler.factFile.filter((col('CategoryName')==self.CATEGORY)&(col('SubCategoryName')==self.SUBCATEGORY)).select('FileName').collect()
@@ -1014,8 +1649,6 @@ class ETLModule_POS(POS):
             notebookutils.fs.mkdirs(self.ProcessedDir)
         if not notebookutils.fs.exists(self.BadFilesDir):
             notebookutils.fs.mkdirs(self.BadFilesDir)
-        if not notebookutils.fs.exists(self.BlankdDir):
-            notebookutils.fs.mkdirs(self.BlankdDir)
 
         if self.dev:
             self.Logger.append("===============================================================")
@@ -1144,6 +1777,16 @@ class ETLModule_POS(POS):
             )
         return True
 
+    def move_to_badfile(self, FileNameList):
+        # `FileNameList`` 
+        self.Logger.append('move all to badfiles')
+        if not self.dev:
+            if not notebookutils.fs.exists(self.BadFilesDir):
+                notebookutils.fs.mkdirs(self.BadFilesDir)
+            for FILE_NAME in FileNameList:
+                notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.BadFilesDir)
+        return True
+
     def load_staging(self):
         self.Logger.append("\tStarting Load Staging process...")
 
@@ -1166,15 +1809,15 @@ class ETLModule_POS(POS):
         self.loadtofactObj.run()
         self.Logger = self.Logger + self.loadtofactObj.Logger
 
-    def remove_from_fact(self, rows_to_delete):
+    def remove_from_fact(self):
         self.Logger.append('\t\tremove_from_fact processing')
-        factTable_remaining = self.factTable.join(rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
+        factTable_remaining = self.factTable.join(self.rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
         factTable_remaining.write.mode("overwrite").save(self.path_to_fact_table)
         self.factTable = spark.read.load(self.path_to_fact_table)
 
-    def remove_from_mismatch(self, rows_to_delete):
+    def remove_from_mismatch(self):
         self.Logger.append('\t\tremove_from_mismatch processing')
-        mismatchTable_remaining = self.mismatchTable.join(rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
+        mismatchTable_remaining = self.mismatchTable.join(self.rows_to_delete.select("FileKey"), on="FileKey", how="left_anti")
         mismatchTable_remaining.write.mode("overwrite").save(self.path_to_mismatch)
         self.mismatchTable = spark.read.load(self.path_to_mismatch)
 
@@ -1185,42 +1828,36 @@ class ETLModule_POS(POS):
         self.FactFileHandler.factFile = self.FactFileHandler.factFile.withColumn('LoadStatus',when(col('FileKey').isin(rows_to_update), 4).otherwise(col('LoadStatus')))
         self.FactFileHandler.saveTable()
 
-    def remove_previous_data(self, sameFile):
+    def remove_previous_data(self):
         self.Logger.append('\t\tremove_previous_data processing')
         window_spec = Window.partitionBy("FileName").orderBy(coalesce(col("FileKey"),lit(0)).desc())
         self.rows_to_delete = self.FactFileHandler.factFile\
-                                    .filter(col("FileName").isin(sameFile))\
+                                    .filter(col("FileName").isin(self.sameFile))\
                                     .withColumn("row_number", row_number().over(window_spec))\
                                     .filter((col("row_number") > 1)) \
                                     .select("FileKey", 'LoadStatus')
     
-        self.remove_from_fact(self.rows_to_delete)
-        self.remove_from_mismatch(self.rows_to_delete)
+        self.remove_from_fact()
+        self.remove_from_mismatch()
         
-    # def move_to_processed_old(self,FILENAME_FILEKEY_mapper):
-    #     """
-    #     Move the file to the processed directory.
-    #     """
-    #     self.FILENAME_FILEKEY_mapper_succes = {}
-    #     self.FILENAME_FILEKEY_mapper_fail = {}
-    #     self.Logger.append(f'\t\tmove file to processed ...: num of file = {len(self.FileNameList)}')
+    def move_to_processed_old(self,FILENAME_FILEKEY_mapper):
+        """
+        Move the file to the processed directory.
+        """
+        self.FILENAME_FILEKEY_mapper_succes = {}
+        self.FILENAME_FILEKEY_mapper_fail = {}
+        self.Logger.append(f'\t\tmove file to processed ...: num of file = {len(self.FileNameList)}')
 
-    #     for FILE_NAME in self.FileNameList:
-    #         if FILE_NAME in self.list_Processed_file:
-    #             self.sameFile.append(FILE_NAME)
-
-    #         try:
-    #             if not self.dev:
-    #                 notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=True)
-    #                 self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-    #         except:
-    #             self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
-
-    def getSameFile(self):
         for FILE_NAME in self.FileNameList:
             if FILE_NAME in self.list_Processed_file:
                 self.sameFile.append(FILE_NAME)
-        self.Logger.append(f'\t\tnum file that come agian = {len(self.sameFile)}')
+
+            try:
+                if not self.dev:
+                    notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=True)
+                    self.FILENAME_FILEKEY_mapper_succes[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
+            except:
+                self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
 
     def move_to_processed(self,FILENAME_FILEKEY_mapper):
         """
@@ -1231,6 +1868,10 @@ class ETLModule_POS(POS):
         self.Logger.append(f'\t\tmove file to processed ...: num of file = {len(self.FileNameList)}')
 
         for FILE_NAME in self.FileNameList:
+            # print(self.list_Processed_file)
+            if FILE_NAME in self.list_Processed_file:
+                self.sameFile.append(FILE_NAME)
+
             try:
                 if not self.dev:
                     notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.ProcessedDir,create_path=True, overwrite=True)
@@ -1238,20 +1879,23 @@ class ETLModule_POS(POS):
             except:
                 self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
         
-        return True
-    
-    def move_to_badfile(self, FILENAME_FILEKEY_mapper):
-        """
-        Move the file to the processed directory: in batch.
-        """
-        self.FILENAME_FILEKEY_mapper_fail = {}
-        self.Logger.append(f'\t\tmove file to badfiles ...: num of file = {len(self.FileNameList)}')
+        # now we have a list of existing filename (sameFile)
 
-        for FILE_NAME in self.FileNameList:
-            if not self.dev:
-                notebookutils.fs.mv(os.path.join(self.FILE_PATH_ON_LAKE,FILE_NAME),self.BadFilesDir,create_path=True, overwrite=True)
-                self.FILENAME_FILEKEY_mapper_fail[FILE_NAME] = FILENAME_FILEKEY_mapper[FILE_NAME]
+        self.Logger.append(f'\t\tnum file that have ever come = {len(self.sameFile)}')
         
+        # print('\t\t updating fact file ...') #move outside to do in batch
+        # self.addToFactFile(self.FILENAME_FILEKEY_mapper_succes, 1)
+        # self.addToFactFile(self.FILENAME_FILEKEY_mapper_fail, 3)
+        # self.EditFactFile(, 1) #ETL success and move file to processed
+        # self.EditFactFile(self.FILENAME_FILEKEY_mapper_fail, 3) #ETL success but move file to processed failed
+        # self.FactFileHandler.EditManyRecords(
+        #     FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_succes,
+        #     LoadStatus=1
+        #     )
+        # self.FactFileHandler.EditManyRecords(
+        #     FILENAME_FILEKEY_mapper=self.FILENAME_FILEKEY_mapper_fail,
+        #     LoadStatus=3
+        #     )
         return True
 
     def moveBlankFile(self):
@@ -1259,13 +1903,9 @@ class ETLModule_POS(POS):
             if FILE_INFO.size == 0:
                 notebookutils.fs.mv(FILE_INFO.path,os.path.join(self.BlankdDir,FILE_INFO.name),create_path=True, overwrite=True)
 
-    def move_file(self, status):
-        if status == 'success':
-            if not self.move_to_processed(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
-                raise AssertionError('error in move_to_processed with load status = 3')
-        elif status == 'fail':
-            if not self.move_to_badfile(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
-                raise AssertionError('error in move_to_processed with load status = 3')
+    def move_file(self):
+        if not self.move_to_processed(self.FILENAME_FILEKEY_mapper): #if move_to_processed is error
+            raise AssertionError('error in move_to_processed with load status = 3')
 
     def main_ETL(self):
         if self.SUBCATEGORY.upper() in ['TRN', 'AR', ]: # TODO: add package need `updateGradeAndHose`
@@ -1297,10 +1937,9 @@ class ETLModule_POS(POS):
             self.moveBlankFile()
             self.load_staging()
             try:
-                self.getSameFile()
-                self.remove_previous_data(self.sameFile)
                 self.main_ETL()
-                self.move_file(status = 'success')
+                self.move_file()
+                self.remove_previous_data()
                 self.Logger.append("ETL process completed successfully.")
                 self.Logger.append("========================================================================================")
                 print('\n'.join(self.Logger))
@@ -1308,17 +1947,21 @@ class ETLModule_POS(POS):
 
             except Exception as e:
                 self.Logger.append(f"\t\tmain ETL process failed: {e}")
-                self.move_file(status = 'fail')
+                # self.move_to_badfile(self.FileNameList)
+                self.addToFactFile(self.FILENAME_FILEKEY_mapper, -99)
                 self.Logger.append("========================================================================================")
                 return self
             
         except Exception as e:
             self.Logger.append(f"Load Staging process failed: {e}")
             try:
-                self.move_file(status = 'fail')
+                # self.move_to_badfile(self.FileNameList)
                 return self
             except:
                 return self
+            # self.addToFactFile(2)
+            self.Logger.append("========================================================================================")
+            return self
 
 class MismatchModule_POS(POS):
     dev = None
@@ -1422,6 +2065,8 @@ class MismatchModule_POS(POS):
         self.Logger.append("ETL mismatch process completed successfully.")
 
         return self #to call updateLoadStatusTo1 outside sequential
+
+
 
 class CashPickUp:
 
@@ -1856,4 +2501,3 @@ class CashPickUp_SAP:
         self.remove_previous_data()
         self.save_to_fact()
         self.move_to_processed()
-

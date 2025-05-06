@@ -83,8 +83,19 @@ class factBibo(Bibo):
         new_row = Row(FileKey=FileKey, FileName=FileName, CategoryName=CategoryName, SubCategoryName=SubCategoryName, LoadDateKey=current_date[0], LoadTimeKey=current_date[1], LoadStatus=LoadStatus)
         print(new_row)
         new_row = spark.createDataFrame([new_row], schema = self.factFile.schema)
-        new_row.write.mode('append').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
-            .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+        retry = 0
+        success = False
+        while not success and retry < 10:
+            try:
+                new_row.write.mode('append').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
+                    .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+                success = True
+            except Exception as e:
+                retry += 1
+            if retry < 10:
+                sleep(60)
+            else:
+                raise
 
     def updateFactFile(self,FileKey,keyChange):
         # factFile
@@ -103,8 +114,19 @@ class factBibo(Bibo):
         newRowToUpdate = Row(**updateValue)
         newRowToUpdateDF = spark.createDataFrame([newRowToUpdate], schema=self.factFile.schema)
         updatedFactFile = recordNotUpdate.unionByName(newRowToUpdateDF)
-        updatedFactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
-            .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+        retry = 0
+        success = False
+        while not success and retry < 10:
+            try:
+                updatedFactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
+                    .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+                success = True
+            except Exception as e:
+                retry += 1
+            if retry < 10:
+                sleep(60)
+            else:
+                raise
 
     def transformSalesGroup(self,x):
         return "Metro" if ((x == "Bangkok") | (x == "Vicinity")) else x
@@ -340,8 +362,19 @@ class factBibo(Bibo):
         FileKeys = [row.FileKey for row in FileKeys.select("FileKey").collect()]
 
         newfactFile = self.factFile.withColumn('LoadStatus',when(col('FileKey').isin(FileKeys) & (col('FileKey')!=todayFileKey),lit(6).cast(ShortType())).otherwise(col('LoadStatus')))
-        newfactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
-            .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+        retry = 0
+        success = False
+        while not success and retry < 10:
+            try:
+                newfactFile.write.mode('overwrite').partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
+                    .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+                success = True
+            except Exception as e:
+                retry += 1
+            if retry < 10:
+                sleep(60)
+            else:
+                raise
 
         self.factFile = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
 
@@ -459,8 +492,19 @@ class MismatchBibo(Bibo):
         factfile_updated_df = self.factFile.alias("fact").join(valid_filekeys.alias("valid"), col("fact.filekey") == col("valid.filekey"), "left")\
             .withColumn("LoadStatus", when(col("valid.filekey").isNotNull(), 1).otherwise(col("fact.LoadStatus"))).select("fact.*",'LoadStatus')
 
-        factfile_updated_df.write.mode("overwrite").partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
-            .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+        retry = 0
+        success = False
+        while not success and retry < 5:
+            try:
+                factfile_updated_df.write.mode("overwrite").partitionBy(['SubcategoryName','CategoryName','LoadStatus']).option('overwriteSchema','true')\
+                    .save(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
+                success = True
+            except Exception as e:
+                retry += 1
+            if retry < 10:
+                sleep(60)
+            else:
+                raise
         self.factFile = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/factfile')
 
     def runMismatch(self):

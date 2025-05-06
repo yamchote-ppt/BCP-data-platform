@@ -7,11 +7,11 @@ import re
 import os
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
-import src.etl.utils as utils
+import env.utils as utils
 from pyspark.sql.window import Window
 import shutil
 from decimal import Decimal
-# import notebookutils
+import notebookutils
 import hashlib
 from tqdm import tqdm
 import time
@@ -310,8 +310,8 @@ class CashPickUp_DropDate:
                             ))
                         )
                     ).withColumn('YearMonth_DropDate', concat(
-                                substring(col('DropDate').cast(StringType()), 1, 4),
-                                substring(col('DropDate').cast(StringType()), 5, 2)).cast(IntegerType())
+                        substring(col('CheckTime').cast(StringType()), 1, 4),
+                        substring(col('CheckTime').cast(StringType()), 6, 2)).cast(IntegerType())
                     ).groupBy(
                         'StationKey',
                         'StationCode',
@@ -350,25 +350,45 @@ class CashPickUp_SAP:
         self.STAGING_TABLE_PATH = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.BronzeLH_ID}/Tables/{self.STAGING_TABLE_NAME}'
         self.FACT_TABLE_PATH = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/{self.FACT_TABLE_NAME}'
         self.FACT_TABLE = spark.read.load(self.FACT_TABLE_PATH)
+        if self.CODE == '1000020':
+            self.MISMATCH_PATH = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/bgn_mismatch_SAP_1000020'
 
         self.current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
         self.Logger = []
 
     def readFile(self):
 
-        df = pd.read_excel(self.FILE_PATH_ON_LAKE,skiprows=4).fillna("").astype("str").sum(axis=1).str.split("\t",expand=True)
-        df_col = df.iloc[0].str.replace('.','').str.replace('G/L','G_L')
-        df = df.iloc[2:]
-        df.columns = df_col.str.strip().apply(lambda x: '-' if len(x) == 0 else x)
-        df = df.iloc[:-2]
-        df = df.drop(columns='-')
+        try:
+            df = pd.read_excel(self.FILE_PATH_ON_LAKE,skiprows=5,engine="openpyxl").fillna("").astype("str").sum(axis=1).str.split("\t",expand=True)
+            df_col = df.iloc[0].str.replace('.','').str.replace('G/L','G_L')
+            df = df.iloc[2:]
+            df.columns = df_col.str.strip().apply(lambda x: '-' if len(x) == 0 else x)
+            df = df.iloc[:-2]
+            df = df.drop(columns='-')
+        except:
+            df = pd.read_csv(
+                    self.FILE_PATH_ON_LAKE,
+                    encoding="utf-16",
+                    sep="\t",  # Change to "," if it's comma-separated
+                    skiprows=5,  # Adjust if needed based on your file
+                    dtype=str
+                )
+            df.columns = df.columns.str.replace('.','').str.replace('G/L','G_L').str.strip()
+            df = df.dropna(subset='Text')
+            df = df.drop(columns=[column for column in df.columns if 'Unnamed' in column])
+
         return df
 
     def load_to_staging(self):
         df = self.readFile()
-        df = df[df['Text'].str.contains('CPICK')]
+        if self.CODE == '1106070':
+            df = df[df['Text'].str.contains('CPICK')]
+        elif self.CODE == '1000020':
+            df = df[df['G_L'].str.len()>=1]
+        else:
+            raise NameError("Not Correct CODE")
         df['AssignmentDate'] = df['Assignment'].str[-8:]
-        df['DocDate'] = pd.to_datetime(df['Doc Date'].str.replace(".",""),format="%m%d%Y").dt.strftime('%Y%m%d')
+        df['DocDate'] = pd.to_datetime(df['Doc Date'].str.replace(".",""),format="%d%m%Y").dt.strftime('%Y%m%d')
         df['POSNumber'] = df['Assignment'].str[:5]
         df['Amount in doc curr'] = df['Amount in doc curr'].str.strip()
         df['DocumentNo'] = df['DocumentNo'].str.strip()
@@ -383,21 +403,42 @@ class CashPickUp_SAP:
         )
 
         dimstation = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimstation').select(col('POSCode').alias('POSNumber'),'StationKey','CustomerCode')
-        df = df.join(dimstation, on='POSNumber', how='left')
-        df = df.withColumns(
-                {
-                    'Amount_DOC_Curr': col('AmountCURR').cast(DecimalType(18,2)),
-                    'EntryDate': lit(None),
-                 }
-            ).withColumnsRenamed(
-                {
-                    'Ty':'Type',
-                    'DocDate': 'DOC_Date',
-                    'DocumentNo': 'DOC_Number',
-                    'AssignmentDate':'AssignmentDateKey',
-                    'POSNumber': 'StationCode'
-                }
-            )
+        df = df.join(dimstation, on='POSNumber', how='left').filter(col('StationKey').isNotNull())
+        if self.CODE == '1106070':
+            df = df.withColumns(
+                    {
+                        'Amount_DOC_Curr': col('AmountCURR').cast(DecimalType(18,2)),
+                        'EntryDate': lit(None),
+                    }
+                ).withColumnsRenamed(
+                    {
+                        'Ty':'Type',
+                        'DocDate': 'DOC_Date',
+                        'DocumentNo': 'DOC_Number',
+                        'AssignmentDate':'AssignmentDateKey',
+                        'POSNumber': 'StationCode'
+                    }
+                )
+        elif self.CODE == '1000020':
+            df = df.withColumns(
+                    {
+                        'Amount_DOC_Curr': col('AmountCURR').cast(DecimalType(18,2)),
+                        'DocumentNo': col('DocumentNo').cast(StringType()),
+                    }
+                ).withColumnsRenamed(
+                    {
+                        'ETL_Date':'ETL_DATE',
+                        'Ty':'Type',
+                        'DocDate': 'DOC_Date',
+                        'DocumentNo': 'DOC_No',
+                        'AssignmentDate':'AssignmentDateKey',
+                        'POSNumber': 'StationCode'
+                    }
+                )
+            df_not_match = df.filter(length(col('AssignmentDateKey'))!=8).select(spark.read.load(self.STAGING_TABLE_PATH).columns).withColumn('Error', lit("MismatchAssignment"))
+            df_not_match.write.mode('append').save(self.MISMATCH_PATH)
+            df = df.filter(length(col('AssignmentDateKey'))==8)
+            
         df = df.select(spark.read.load(self.STAGING_TABLE_PATH).columns)
         df = utils.copySchemaByName(df, spark.read.load(self.STAGING_TABLE_PATH))
         df.write.mode('overwrite').save(self.STAGING_TABLE_PATH)
@@ -405,172 +446,21 @@ class CashPickUp_SAP:
 
     def remove_previous_data(self):
         self.YYYYMM_DocDate = self.STAGING_TABLE.select(col('YYYYMM_DocDate').alias('YearMonth_DocDate')).distinct()
-
-        '''
-        delete FROM [BCP-DW].[dbo].[BGN_fact_SAP_1106070]
-        where YearMonth_DocDate = ?
-        '''
         self.table = self.FACT_TABLE.join(self.YYYYMM_DocDate, on='YearMonth_DocDate', how='left_anti')
 
     def save_to_fact(self):
         self.STAGING_TABLE = utils.copySchemaByName(self.STAGING_TABLE, self.FACT_TABLE)
-        print(utils.trackSizeTable(self.table,schema=True))
-        print(utils.trackSizeTable(self.STAGING_TABLE,schema=True))
         self.table = self.table.unionByName(
-            self.STAGING_TABLE.withColumnRenamed('YYYYMM_DocDate','YearMonth_DocDate')
+            self.STAGING_TABLE.withColumnRenamed('YYYYMM_DocDate','YearMonth_DocDate').drop('EntryDate')
         )
         self.table.write.mode('overwrite').save(self.FACT_TABLE_PATH)
 
+    def move_to_processed(self):
+        notebookutils.fs.mkdirs(self.ProcessedDir)
+        notebookutils.fs.mv(self.FILE_PATH_ON_LAKE, self.ProcessedDir, create_path=True)
+
     def runETL(self):
-        self.readFile()
         self.load_to_staging()
         self.remove_previous_data()
         self.save_to_fact()
-
-
-    # def load_staging(self):
-    #     # self.Logger.append('\tStarting Load Staging process...')
-    #     # # raise NotImplementedError('load_staging is not implemented yet')
-    #     # self.stagingTable = self.readFile()
-    #     # self.stagingTable.write.mode('overwrite').save(self.STAGING_TABLE_PATH)
-    #     # self.stagingTable = spark.read.load(self.STAGING_TABLE_PATH)
-    
-    # def delete_duplicate_file(self):
-    #     # self.Logger.append('\tStarting Delete Duplicate File process...')
-    #     # # raise NotImplementedError('delete_duplicate_file is not implemented yet')
-    #     # factTable = spark.read.load(self.FACT_TABLE_PATH)
-    #     # stagingTable = spark.read.load(self.STAGING_TABLE_PATH)
-    #     # factTable = factTable.join(stagingTable, on='FileName', how='left_anti')
-    #     # factTable.write.mode('overwrite').save(self.FACT_TABLE_PATH)
-
-    #     # self.stagingTable = spark.read.load(self.STAGING_TABLE_PATH)
-    #     # self.factTable = spark.read.load(self.FACT_TABLE_PATH)
-    
-    # def get_last_row_number(self):
-    #     # self.Logger.append('\tStarting Get Last Row Number process...')
-    #     # # raise NotImplementedError('get_last_row_number is not implemented yet')
-    #     # '''
-    #     # select top 1 RowNumber FROM (
-    #     #     SELECT RowNumber
-    #     #     FROM [BCP-DW].[dbo].[BGN_fact_CashPickUp]
-    #     #     UNION
-    #     #     SELECT 0 as RowNumber) T1
-    #     # ORDER BY 1 DESC
-    #     # '''
-    #     # factTable = spark.read.load(self.FACT_TABLE_PATH)
-    #     # if factTable.count() != 0:
-    #     #     lastNum = factTable.select('RowNumber').orderBy('RowNumber', ascending=False).limit(1).collect()[0].RowNumber
-    #     # else:
-    #     #     lastNum = 0
-    #     # self.lastNum = lastNum
-
-    # def get_data_and_time(self):
-    #     # self.stagingTable = self.stagingTable\
-    #     #         .withColumn('Drop_Date', regexp_extract(col('_c5'), r'([0-9]+) [0-9]+',1))\
-    #     #         .withColumn('Drop_Time', regexp_extract(col('_c5'), r'[0-9]+ ([0-9]+)',1))\
-    #     #         .withColumn('Tranfer_Date', regexp_extract(col('_c9'), r'([0-9]+) [0-9]+',1))\
-    #     #         .withColumn('Tranfer_Time', regexp_extract(col('_c9'), r'[0-9]+ ([0-9]+)',1))\
-    #     #         .withColumn('DropDate_Time', regexp_replace(col('_c5'), " ", ""))\
-    #     #         .withColumn('DropTime_TypeTime', concat(
-    #     #                                                 substring(trim(regexp_replace(col('_c5'), r'.* ', '')), 1, 2), lit(':'),
-    #     #                                                 substring(trim(regexp_replace(col('_c5'), r'.* ', '')), 3, 2), lit(':'),
-    #     #                                                 substring(trim(regexp_replace(col('_c5'), r'.* ', '')), 5, 2)
-    #     #                                             ))
-    #     # '''
-    #     # SUBSTRING(
-    #     #     TRIM(RIGHT([Column 5],LEN([Column 5]) - FINDSTRING([Column 5]," ",1))),
-    #     #     1,
-    #     #     2) 
-    #     # + ":" + 
-    #     # SUBSTRING(TRIM(RIGHT([Column 5],LEN([Column 5]) - FINDSTRING([Column 5]," ",1))),3,2) 
-    #     # + ":" + 
-    #     # SUBSTRING(TRIM(RIGHT([Column 5],LEN([Column 5]) - FINDSTRING([Column 5]," ",1))),5,2)
-    #     # '''
-
-    # def split_not_null_column2(self):
-    #     # self.stagingTable = self.stagingTable.filter(col('_c2').isNotNull())
-
-    # def data_conversion(self):
-    #     # self.stagingTable = self.stagingTable.withColumn("DropDate", col("Drop_Date").cast(IntegerType())) \
-    #     #                                     .withColumn("DropTime", col("Drop_Time").cast(IntegerType())) \
-    #     #                                     .withColumn("TransferDate", col("Tranfer_Date").cast(IntegerType())) \
-    #     #                                     .withColumn("TransferTime", col("Tranfer_Time").cast(IntegerType())) \
-    #     #                                     .withColumn("Amount", col("_c8").cast(DecimalType(10,2))) \
-    #     #                                     .withColumn("Customer_code", col("_c1").cast(IntegerType())) \
-    #     #                                     .withColumn("POS_Code", col("_c2").cast(IntegerType())) \
-    #     #                                     .withColumn("PacketNumber", col("_c6").cast(IntegerType())) \
-    #     #                                     .withColumn("CashierCode", col("_c7").cast(IntegerType())) \
-    #     #                                     .withColumn("DropTime_TypeTime", col("DropTime_TypeTime").cast(TimestampType()))
-
-    # def get_dimstation(self):
-    #     # '''
-    #     # SELECT [StationKey]
-    #     #     ,[SOR]
-    #     #     ,[CustomerCode]
-    #     #     ,Poscode
-    #     # FROM [BCP-DW].[dbo].[dimStation]
-    #     # '''
-    #     # self.dimstation = spark.read.load(f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.SilverLH_ID}/Tables/dimstation')\
-    #     #                         .select('StationKey','SOR','CustomerCode','Poscode')\
-    #     #                         .withColumnRenamed('CustomerCode','Customer_code')\
-    #     #                         .withColumnRenamed('Poscode','POS_Code')\
-
-    # def merge_join(self):
-    #     # self.stagingTable = self.stagingTable.join(
-    #     #                         self.dimstation,
-    #     #                         on = ['Customer_code','POS_Code'],
-    #     #                         how= 'left'
-    #     #                     ) #-> to get 'StationKey' and 'SOR'
-
-    # def add_row_num(self):
-    #     # windowSpec = Window.orderBy('FileName')
-    #     # self.stagingTable = self.stagingTable.withColumn('RowNumber', row_number().over(windowSpec) + self.lastNum)
-
-    # def save_to_fact(self):
-    #     # self.stagingTable = self.stagingTable.drop(*[f'_c{i}' for i  in range(10)],'Drop_Date')\
-    #     #                         .withColumnsRenamed({
-    #     #                             'POS_Code':'StationCode',
-    #     #                             'Customer_code':'CustomerCode',
-    #     #                             'Tranfer_Date':'TranferDate',
-    #     #                             'Tranfer_Time':'TranferTime',
-    #     #                             'DropDate_Time':'DropDateTime'})\
-    #     #                         .select(spark.read.load(self.FACT_TABLE_PATH).columns)
-    #     # self.stagingTable = utils.copySchemaByName(self.stagingTable, spark.read.load(self.FACT_TABLE_PATH))
-    #     # self.pandas_df = self.stagingTable.toPandas()
-    #     # self.stagingTable.write.mode('overwrite').save(self.FACT_TABLE_PATH+'_new')
-    #     # spark.read.load(self.FACT_TABLE_PATH+'_new').write.mode('append').save(self.FACT_TABLE_PATH)
-
-    # def load_to_fact(self):
-    #     # self.Logger.append('\tStarting Load to Fact process...')
-    #     # # raise NotImplementedError('load_to_fact is not implemented yet')
-    #     # self.get_data_and_time()
-    #     # self.split_not_null_column2()
-    #     # self.data_conversion()
-
-    #     # self.get_dimstation()
-    #     # self.merge_join()
-    #     # self.add_row_num()
-    #     # self.save_to_fact()
-
-    # def move_file(self):
-    #     # self.Logger.append('\tStarting Move File')
-    #     # # self.FilePathList
-    #     # for file in self.FilePathList:
-    #     #     file = file.replace('%23', '#')
-    #     #     file = re.match(r'(.*\.CSV).*',file).group(1)
-    #     #     dest_path = file.replace('/Ingest/', '/Processed/')
-    #     #     dest_path = re.sub(r'/[^/]+$','',dest_path)
-    #     #     # print(f'file = {file}')
-    #     #     # print(f'dest_path = {dest_path}')
-
-    #     #     notebookutils.fs.mv(file, dest_path, create_path=True, overwrite=True)
-
-    # def run_CPU(self):
-    #     # self.Logger.append("Starting Cash Pick Up process...")
-    #     # self.load_staging()
-    #     # self.delete_duplicate_file()
-    #     # self.get_last_row_number()
-    #     # self.load_to_fact()
-    #     # self.move_file()
-    #     # self.Logger.append("Cash Pick Up process completed successfully.")
-    #     # return self.pandas_df
+        self.move_to_processed()
