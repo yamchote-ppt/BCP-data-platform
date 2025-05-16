@@ -1125,7 +1125,7 @@ class POS:
     
     @staticmethod
     def _look_up_product_no_title(incomingDF,mappingProductNoTitle, SourceKey_key, StationKey_key):
-        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(StationKey_key)})
+        incomingDF = incomingDF.drop('MappingKey').withColumns({'key1':col(SourceKey_key),'key2':col(StationKey_key)})
         mappingProductjoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key2'})
         mappingProductjoin.printSchema()
         lookupCondition = ['key1','key2']
@@ -1474,7 +1474,7 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
             return None
         else:
             mappingProductNoTitle = spark.read.load(f'{self.SilverLH_path}/Tables/mappingproduct')
-            mappingProductNoTitle = mappingProductNoTitle.filter(self.add_condition_no_title_mapping[(CATEGORY, SUBCATEGORY)]).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
+            mappingProductNoTitle = mappingProductNoTitle.filter(self.add_condition_no_title_mapping[(CATEGORY, SUBCATEGORY)]).select(col('SourceKey'),col('StationKey'),col('MappingKey')).drop_duplicates()
             mappingProductNoTitle = utils.trim_string_columns(mappingProductNoTitle)
             return mappingProductNoTitle
 
