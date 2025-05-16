@@ -1111,6 +1111,31 @@ class POS:
         stagingTable = stagingTable.join(factFile.select('FileKey','FileName'), on='FileKey', how='left')
         return stagingTable
     
+    @staticmethod
+    def _look_up_product(incomingDF, mappingProduct, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key):
+        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(SourceTitle_key)})
+        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'})
+        lookupCondition = ['key1','key2']
+        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
+        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
+        if SUBCATEGORY == 'EOD_TANKS' and CATEGORY == 'FLOWCO':
+            UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0))
+        return matchProduct, UnMatchProduct
+    
+    @staticmethod
+    def _look_up_product_no_title(incomingDF,mappingProductNoTitle, SourceKey_key, StationKey_key):
+        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(StationKey_key)})
+        mappingProductjoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key2'})
+        mappingProductjoin.printSchema()
+        lookupCondition = ['key1','key2']
+        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner')
+        matchProduct.printSchema()
+        matchProduct = matchProduct.drop('key1','key2')
+        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
+        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProductNoTitle: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
+        return matchProduct, UnMatchProduct
+    
 class POS_to_staging(POS):
     '''
     Expected all file in this state have thier own FileKey in FactFile whose `LoadStatus = lit(None)`
@@ -1215,11 +1240,14 @@ class POS_to_staging(POS):
             notebookutils.fs.mv(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/', f'{self.BadFilesDir}/POS/FLOWCO/',create_path=True,overwrite=True)
             notebookutils.fs.mkdirs(f'{self.BronzeLH_path}/Files/Ingest/POS/FLOWCO/{self.SUBCATEGORY}/')
 
+    def saveStagingTable(self, df):
+        df.select(*set(self.stagingSchema.columns + ['LoadDateKey', 'LoadTimeKey', "FileName"])).write.mode('overwrite').option("overwriteSchema", "true").save(self.path_to_staging)
+
     def fromRawToStaging(self):
         try:
             # self.truncate_staging()
             self.stagingTable = self.readRawFiles()
-            self.stagingTable.select(*set(self.stagingSchema.columns + ['LoadDateKey', 'LoadTimeKey', "FileName"])).write.mode('overwrite').option("overwriteSchema", "true").save(self.path_to_staging)
+            self.saveStagingTable(self.stagingTable)
             self.move_to_loadedstaging() # Ingest -> LoadedStaging
             self.STATUS = 'Save to staging succeed'
             return self
@@ -1230,7 +1258,7 @@ class POS_to_staging(POS):
     def fromRawToStaging_no_catch(self):
         # self.truncate_staging()
         self.stagingTable = self.readRawFiles()
-        self.stagingTable.select(*set(self.stagingSchema.columns + ['LoadDateKey', 'LoadTimeKey', "FileName"])).write.mode('overwrite').option("overwriteSchema", "true").save(self.path_to_staging)
+        self.saveStagingTable(self.stagingTable)
         self.move_to_loadedstaging() # Ingest -> LoadedStaging
         self.STATUS = 'Save to staging succeed'
         return self
@@ -1284,8 +1312,14 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
             'REFUND':self.pre_transform_REFUND
         }
 
-    def load_staging_table(self):
-        return spark.read.load(self.path_to_staging)
+    def load_staging_table(self): # do with mismatch table simultaneously
+        mismatch = spark.read.load(self.path_to_mismatch)                           # load mismatch table
+        oriMismatchColumns = mismatch.columns
+        mismatch = mismatch.join(spark.read.load(self.path_to_factfile).select('FileKey','FileName','LoadDateKey', 'LoadTimeKey'), on='FileKey', how='left') # join with factfile to get FileName
+        mismatch.drop('Error').write.mode('append').save(self.path_to_staging)      # append to staging table
+        mismatch.limit(0).select(oriMismatchColumns).write.mode('overwrite').save(self.path_to_mismatch)       # clear mismatch table (because we already append to staging table)
+        staging = spark.read.load(self.path_to_staging)
+        return staging
 
     def add_category_column(self, stagingTable):
         stagingTable = self.derivedField(stagingTable, {
@@ -1375,6 +1409,7 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
                 'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
                 'ReStationName': regexp_replace('StationName', ' ', ''),
             })
+        return stagingTable
     
     def pre_transform_POINTS(self, stagingTable):
         stagingTable = self.derivedField(stagingTable, {
@@ -1384,12 +1419,14 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
                 'Collect_Time': trim(substring_index(col('Collect_TimeStemp'), ' ', -1)),
                 'YearKey': floor(col('TransDateKey') / 10000)
             })
+        return stagingTable
         
     def pre_transform_REFUND(self, stagingTable):
         stagingTable = self.derivedField(stagingTable, {
                 'TransTimeKey': concat(regexp_replace('TransTime', ':', ''), lit('00')),
                 'ReStationName': regexp_replace('StationName', ' ', ''),
             })
+        return stagingTable
 
     def pre_transform(self, stagingTable, SUBCATEGORY):
         stagingTable = self.add_category_column(stagingTable)
@@ -1397,13 +1434,13 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
         stagingTable = pre_transform_func(stagingTable)
         return stagingTable
 
-    def look_up_stationKey(self, stagingTable, dimstation, POSName_key, POSCode_key, CustomerCode_key):
+    def look_up_stationKey(self, stagingTable, POSName_key, POSCode_key, CustomerCode_key):
         if POSName_key:
-            self.dimStation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
+            self.dimstation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
                                 .select(col('StationKey'),col('CustomerCode'),col('POSCode'),regexp_replace(col('PosName'), ' ', '').alias('POSName')).drop_duplicates()
             
             incomingDF = stagingTable.withColumns({'key1':col(POSName_key),'key2':col(POSCode_key),'key3':col(CustomerCode_key)})
-            dimstationjoin = dimstation.withColumnsRenamed({'POSName':'key1','POSCode':'key2','CustomerCode':'key3'})
+            dimstationjoin = self.dimstation.withColumnsRenamed({'POSName':'key1','POSCode':'key2','CustomerCode':'key3'})
             lookupCondition = ['key1','key2','key3']
 
             matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2','key3')
@@ -1411,11 +1448,11 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
             assert incomingDF.count() == matchStation.count() + UnMatchStation.count(), f'Error in lookup station: incomingDF.count() != matchStation.count() + UnMatchStation.count();\nincomingDF.count() = {incomingDF.count()}\nmatchStation.count() = {matchStation.count()}\nUnMatchStation.count() = {UnMatchStation.count()}'
             return matchStation, UnMatchStation
         else:
-            self.dimStation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
+            self.dimstation = spark.read.load(f'{self.SilverLH_path}/Tables/dimstation')\
                                 .select(col('StationKey'),col('CustomerCode'),col('POSCode')).drop_duplicates()
             
             incomingDF = stagingTable.withColumns({'key1':col(POSCode_key),'key2':col(CustomerCode_key)})
-            dimstationjoin = stagingTable.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
+            dimstationjoin = self.dimstation.withColumnsRenamed({'POSCode':'key1','CustomerCode':'key2'})
             lookupCondition = ['key1','key2']
 
             matchStation = incomingDF.join(dimstationjoin, on= lookupCondition, how='inner').drop('key1','key2')
@@ -1440,40 +1477,19 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
             mappingProductNoTitle = mappingProductNoTitle.filter(self.add_condition_no_title_mapping[(CATEGORY, SUBCATEGORY)]).select(col('SourceKey'),col('SourceTitle'),col('MappingKey')).drop_duplicates()
             mappingProductNoTitle = utils.trim_string_columns(mappingProductNoTitle)
             return mappingProductNoTitle
-    
-    @staticmethod
-    def _look_up_product(incomingDF, mappingProduct, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key):
-        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(SourceTitle_key)})
-        mappingProductjoin = mappingProduct.withColumnsRenamed({'SourceKey':'key1','SourceTitle':'key2'})
-        lookupCondition = ['key1','key2']
-        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
-        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
-        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProduct: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
-        if SUBCATEGORY == 'EOD_TANKS' and CATEGORY == 'FLOWCO':
-            UnMatchProduct = UnMatchProduct.filter((col('GradeNumber')==2)&(col('OpenVolume')==0)&(col('CloseVolume')==0)&(col('DeliveryVolume')==0))
-        return matchProduct, UnMatchProduct
 
     def look_up_product(self, incomingDF, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key):
+        # TODO: add job for None incomingDF -> return None
         mappingProduct = self.getMappingProduct(CATEGORY, SUBCATEGORY)
-        if mappingProduct is None:
+        if (incomingDF is None) | (mappingProduct is None):
             return (None, None)
         else:
             matchProduct, UnMatchProduct = self._look_up_product(incomingDF, mappingProduct, CATEGORY, SUBCATEGORY, SourceKey_key, SourceTitle_key)
             return matchProduct, UnMatchProduct
 
-    @staticmethod
-    def _look_up_product_no_title(incomingDF,mappingProductNoTitle, SourceKey_key, StationKey_key):
-        incomingDF = incomingDF.withColumns({'key1':col(SourceKey_key),'key2':col(StationKey_key)})
-        mappingProductjoin = mappingProductNoTitle.withColumnsRenamed({'SourceKey':'key1','StationKey':'key2'})
-        lookupCondition = ['key1','key2']
-        matchProduct = incomingDF.join(mappingProductjoin, on=lookupCondition, how='inner').drop('key1','key2')
-        UnMatchProduct  = incomingDF.join(mappingProductjoin, on=lookupCondition, how='left_anti').withColumn('Error',lit("Mismatch ProductKey")).drop('key1','key2')
-        assert incomingDF.count() == matchProduct.count() + UnMatchProduct.count(), f'Error in lookup mappingProductNoTitle: incomingDF.count() != matchProduct.count() + UnMatchProduct.count(); incomingDF.count() = {incomingDF.count()}; matchProduct.count() = {matchProduct.count()}; UnMatchProduct.count() = {UnMatchProduct.count()}'
-        return matchProduct, UnMatchProduct
-
     def look_up_product_no_title(self, incomingDF, CATEGORY, SUBCATEGORY, SourceKey_key, StationKey_key):
         mappingProductNoTitle = self.getMappingProductNoTitle(CATEGORY, SUBCATEGORY)
-        if mappingProductNoTitle is None:
+        if (incomingDF is None) | (mappingProductNoTitle is None):
             return (None, None)
         else:
             matchProduct, UnMatchProduct = self._look_up_product_no_title(incomingDF, mappingProductNoTitle, SourceKey_key, StationKey_key)
@@ -1483,15 +1499,15 @@ class POS_ETL(POS_load_to_fact):
     def __init__(self,config):
         super().__init__(config)
 
-    # FIRSTPRO
     def FIRSTPRO(self, stagingTable_firstpro):
         if stagingTable_firstpro.count() > 0:
             match_station_table_firstpro, not_match_station_table_firstpro = self.look_up_stationKey(stagingTable_firstpro, **self.lookupstation_key[('FIRSTPRO', self.SUBCATEGORY)])
-            match_product, not_match_product = self.look_up_product(incomingDF = match_station_table_firstpro, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key[('FIRSTPRO', self.SUBCATEGORY)])
-            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key[('FIRSTPRO', self.SUBCATEGORY)])
+            match_product, not_match_product = self.look_up_product(incomingDF = match_station_table_firstpro, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key.get(('FIRSTPRO', self.SUBCATEGORY), {'SourceKey_key': None, 'SourceTitle_key':None}))
+            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FIRSTPRO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key.get(('FIRSTPRO', self.SUBCATEGORY),{'SourceKey_key':None, 'StationKey_key':None}))
+            
             match_table = match_product_no_title
-
             mismatch_table = not_match_station_table_firstpro
+            
             if not_match_product:
                 mismatch_table = mismatch_table.unionByName(not_match_product,allowMissingColumns=True)
             if not_match_product_no_title:  
@@ -1504,8 +1520,8 @@ class POS_ETL(POS_load_to_fact):
     def FLOWCO(self, stagingTable_flowco):
         if stagingTable_flowco.count() > 0:
             match_staion_table_flowco, not_match_staion_table_flowco = self.look_up_stationKey(stagingTable_flowco, **self.lookupstation_key[('FLOWCO', self.SUBCATEGORY)])
-            match_product, not_match_product = self.look_up_product(incomingDF = match_staion_table_flowco, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key[('FLOWCO', self.SUBCATEGORY)])
-            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key[('FLOWCO', self.SUBCATEGORY)])
+            match_product, not_match_product = self.look_up_product(incomingDF = match_staion_table_flowco, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_key.get(('FLOWCO', self.SUBCATEGORY), {'SourceKey_key': None, 'SourceTitle_key':None}))
+            match_product_no_title, not_match_product_no_title = self.look_up_product_no_title(incomingDF = match_product, CATEGORY = 'FLOWCO', SUBCATEGORY=self.SUBCATEGORY, **self.lookupproduct_no_title_key.get(('FLOWCO', self.SUBCATEGORY),{'SourceKey_key':None, 'StationKey_key':None}))
             match_table = match_product_no_title
 
             mismatch_table = not_match_staion_table_flowco
@@ -1561,37 +1577,42 @@ class POS_ETL(POS_load_to_fact):
         mismatch_table.write.mode('append').save(path_to_save)
 
     def remove_previous_data(self, comingFileName):
-        # ต้องลบแค่ใน fact table กับ mismatch ก่อน แล้วเก็บไปอัพเดต LoadStatus ใน factfile ทีเดียวพร้อมกันกับตัวอื่น ไม่งั้นจะ concurrency conflict
         factfile = spark.read.load(self.path_to_factfile)
 
         fact_table = spark.read.load(self.path_to_fact)
-        fact_table = fact_table.join(factfile.select('FileKey', 'FileName'), on='FileKey', how='left')
-        remove_filekey_fact = fact_table.select('FileKey', 'FileName').join(factfile.select('FileKey', 'FileName'), on='FileName', how='inner').select('FileKey').distinct()
-        new_fact_table = fact_table.join(comingFileName, on='FileName', how='left_anti').drop('FileName')
+        fact_table = fact_table.join(factfile.select('FileKey', 'FileName'), on='FileKey', how='left') # join เพื่อเอา FileName มาใส่ใน fact_table
+        remove_filekey_fact = fact_table.select('FileName', 'FileKey').join(comingFileName, on='FileName', how='inner').select('FileKey').distinct().cache()
+        new_fact_table = fact_table.join(remove_filekey_fact, on='FileKey', how='left_anti').drop('FileName')
         new_fact_table.write.mode('overwrite').save(self.path_to_fact)
 
         mismatch_table = spark.read.load(self.path_to_mismatch)
         mismatch_table = mismatch_table.join(factfile.select('FileKey', 'FileName'), on='FileKey', how='left')
-        remove_filekey_mismatch = mismatch_table.select('FileKey', 'FileName').join(factfile.select('FileKey', 'FileName'), on='FileName', how='inner').select('FileKey').distinct()
-        new_mismatch_table = mismatch_table.join(comingFileName, on='FileName', how='left_anti').drop('FileName')
+        remove_filekey_mismatch = mismatch_table.select('FileKey', 'FileName').join(comingFileName, on='FileName', how='inner').select('FileKey').distinct().cache()
+        new_mismatch_table = mismatch_table.join(remove_filekey_mismatch, on='FileKey', how='left_anti').drop('FileName')
         new_mismatch_table.write.mode('overwrite').save(self.path_to_mismatch)
 
         remove_filekey = remove_filekey_fact.unionByName(remove_filekey_mismatch, allowMissingColumns=True).distinct() # for update LoadStatus = 4 in the last step together with other subcategory
+
         return remove_filekey
         
     def run_etl(self):
         self.stagingTable = self.load_staging_table()
         assert "FileName" in self.stagingTable.columns, f"FileName column not found in staging table {self.STAGING_TABLE_NAME}"
         self.comingFileName = self.stagingTable.select('FileName').distinct().cache()
-        self.remove_filekey = self.remove_previous_data(self.comingFileName) # now same file records is removed from fact and mismatch table
+        self.remove_filekey = self.remove_previous_data(self.comingFileName).cache() # now same file records is removed from fact and mismatch table
 
         self.stagingTable = self.pre_transform(self.stagingTable, self.SUBCATEGORY)
+
         self.stagingTable_firstpro = self.stagingTable.filter(~col('IsFlowCo')).cache()
         self.stagingTable_flowco = self.stagingTable.filter(col('IsFlowCo')).cache()
         self.match_table, self.mismatch_table = self.run_lookup(self.stagingTable_firstpro, self.stagingTable_flowco)
-        self.match_table = self.rename_mappingKey(self.match_table)
-        self.saveMatchTable(self.match_table, self.path_to_fact)
-        self.saveMisMatchTable(self.mismatch_table, self.path_to_mismatch)
+        # TODO; make below code can handle None
+        if self.match_table is not None:
+            self.match_table = self.rename_mappingKey(self.match_table)
+            self.saveMatchTable(self.match_table, self.path_to_fact)
+        
+        if self.mismatch_table is not None:
+            self.saveMisMatchTable(self.mismatch_table, self.path_to_mismatch)
 
 
 
