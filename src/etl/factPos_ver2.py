@@ -625,7 +625,6 @@ class POS_ETL(POS_load_to_fact):
         super().__init__(config)
 
     def FIRSTPRO(self, stagingTable_firstpro):
-        """Handle FIRSTPRO side: station → product → no-title lookups → subcategory tweaks."""
         if stagingTable_firstpro.count() == 0:
             return None, None
 
@@ -635,21 +634,26 @@ class POS_ETL(POS_load_to_fact):
             **self.lookupstation_key[('FIRSTPRO', self.SUBCATEGORY)]
         )
 
-        # 2) Product lookup (with and without title)
+        # 2) Product lookup (title + no-title)
+        prod_args    = self.lookupproduct_key.get(('FIRSTPRO', self.SUBCATEGORY), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FIRSTPRO',
             SUBCATEGORY   = self.SUBCATEGORY,
-            **self.lookupproduct_key.get(('FIRSTPRO', self.SUBCATEGORY), {})
+            **prod_args
+        )
+        no_title_args = self.lookupproduct_no_title_key.get(
+            ('FIRSTPRO', self.SUBCATEGORY),
+            {'SourceKey_key': None, 'StationKey_key': None}
         )
         match_no, unmatch_no = self.look_up_product_no_title(
             incomingDF    = match_prod,
             CATEGORY      = 'FIRSTPRO',
             SUBCATEGORY   = self.SUBCATEGORY,
-            **self.lookupproduct_no_title_key.get(('FIRSTPRO', self.SUBCATEGORY), {})
+            **no_title_args
         )
 
-        # 3) Base match + mismatch assembly
+        # 3) Assemble match + mismatch
         match_table    = match_no
         mismatch_table = unmatch_sta
         if unmatch_prod:
@@ -657,12 +661,11 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_no:
             mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
 
-        # 4) Subcategory-specific final tweaks
+        # 4) Per-subcategory tweaks (EXCEPT the key-column renames)
         sbc = self.SUBCATEGORY.upper()
 
         if sbc == 'PMT':  # PAYMENT
-            # FIRSTPRO payment: rename PayTimeKey→PAY_Time, END_TimeKey→END_Time
-            match_table = (
+            match_table    = (
                 match_sta
                   .withColumn('PAY_Time', col('PayTimeKey')).drop('PayTimeKey')
                   .withColumn('END_Time', col('END_TimeKey')).drop('END_TimeKey')
@@ -670,61 +673,48 @@ class POS_ETL(POS_load_to_fact):
             mismatch_table = unmatch_sta
 
         elif sbc in ['REFUND', 'POINTS', 'DISCOUNT', 'LUBE']:
-            # no‐product branches; just pass station results through
             match_table, mismatch_table = match_sta, unmatch_sta
 
         elif sbc == 'FREE':
-            # FIRSTPRO FREE: inject DeliveryId=NULL, then skip product lookup
-            match_table    = match_sta.withColumn('DeliveryId', lit(None).cast(IntegerType()))
+            # inject DeliveryId=NULL on both sides
+            match_table    = match_sta   .withColumn('DeliveryId', lit(None).cast(IntegerType()))
             mismatch_table = unmatch_sta.withColumn('DeliveryId', lit(None).cast(IntegerType()))
 
         elif sbc == 'TRN':
-            # aggregate: keep positive-volume rows + total per transaction
-            # then rename MappingKey→ProductKey and add Vat=NULL
-            # (we already joined on grade, so MappingKey present)
-            # but match_table currently is just match_no; need to re-run with branches?
-            # simpler: apply on match_table
+            # for FIRSTPRO TRN also aggregate positive volumes + add Vat=NULL
             m1 = match_table.filter(col('Volume') >= 0).drop('Volume','Amount')
             m2 = (
                 match_table.groupBy('CloseDateKey','TransNumber','FileKey')
                            .agg(
-                               spark_sum('Volume').alias('VOLUME'),
-                               spark_sum('Amount').alias('AMOUNT')
+                             spark_sum('Volume').alias('VOLUME'),
+                             spark_sum('Amount').alias('AMOUNT')
                            )
                            .withColumn('VOLUME', col('VOLUME').cast(DecimalType(15,3)))
             )
             match_table = m1.join(m2, ['CloseDateKey','TransNumber','FileKey'], 'inner')
-            match_table = match_table.withColumnsRenamed({'MappingKey':'ProductKey'}) \
-                                     .withColumn('Vat', lit(None))
+            match_table = match_table.withColumn('Vat', lit(None))
 
         elif sbc == 'EOD_METERS':
-            match_table    = match_table.withColumnsRenamed({'MappingKey':'ProductKey'})
-            mismatch_table = mismatch_table
+            # no further transformation here; key-rename happens downstream
+            pass
 
         elif sbc == 'AR_TRANSACTIONS':
-            match_table = match_table.withColumnsRenamed({
-                'MappingKey':'GradeKey',
-                'LBAmount':'LubeAmount',
-                'AttendantNumber':'AttendeeNumber'
-            })
+            # no further transformation here; key-rename happens downstream
+            pass
 
         elif sbc == 'EOD_TANKS':
-            # remove “all-zero” tanks from mismatches; rename MappingKey→ProductKey
+            # FIRSTPRO EOD_TANKS: remove “all-zero” tank records from mismatches
             mismatch_table = mismatch_table.filter(~(
-                  (col('GradeNumber') == 2)
-              &   (col('OpenVolume') == 0)
-              &   (col('CloseVolume') == 0)
-              &   (col('DeliveryVolume') == 0)
+                (col('GradeNumber') == 2)
+             &  (col('OpenVolume') == 0)
+             &  (col('CloseVolume') == 0)
+             &  (col('DeliveryVolume') == 0)
             ))
-            match_table = match_table.withColumnsRenamed({'MappingKey':'ProductKey'})
-
-        # else: other categories have no extra tweak
 
         return match_table, mismatch_table
 
 
     def FLOWCO(self, stagingTable_flowco):
-        """Handle FLOWCO side: same pattern, plus TANKS special."""
         if stagingTable_flowco.count() == 0:
             return None, None
 
@@ -734,21 +724,26 @@ class POS_ETL(POS_load_to_fact):
             **self.lookupstation_key[('FLOWCO', self.SUBCATEGORY)]
         )
 
-        # 2) Product lookup
+        # 2) Product lookup (title + no-title)
+        prod_args    = self.lookupproduct_key.get(('FLOWCO', self.SUBCATEGORY), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FLOWCO',
             SUBCATEGORY   = self.SUBCATEGORY,
-            **self.lookupproduct_key.get(('FLOWCO', self.SUBCATEGORY), {})
+            **prod_args
+        )
+        no_title_args = self.lookupproduct_no_title_key.get(
+            ('FLOWCO', self.SUBCATEGORY),
+            {'SourceKey_key': None, 'StationKey_key': None}
         )
         match_no, unmatch_no = self.look_up_product_no_title(
             incomingDF    = match_prod,
             CATEGORY      = 'FLOWCO',
             SUBCATEGORY   = self.SUBCATEGORY,
-            **self.lookupproduct_no_title_key.get(('FLOWCO', self.SUBCATEGORY), {})
+            **no_title_args
         )
 
-        # 3) Base assembly
+        # 3) Assemble match + mismatch
         match_table    = match_no
         mismatch_table = unmatch_sta
         if unmatch_prod:
@@ -756,28 +751,22 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_no:
             mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
 
-        # 4) FLOWCO TANKS special
+        # 4) Per-subcategory tweaks
         sbc = self.SUBCATEGORY.upper()
+
         if sbc == 'EOD_TANKS':
-            # same “all-zero” removal + rename
             mismatch_table = mismatch_table.filter(~(
-                  (col('GradeNumber') == 2)
-              &   (col('OpenVolume') == 0)
-              &   (col('CloseVolume') == 0)
-              &   (col('DeliveryVolume') == 0)
+                (col('GradeNumber') == 2)
+             &  (col('OpenVolume') == 0)
+             &  (col('CloseVolume') == 0)
+             &  (col('DeliveryVolume') == 0)
             ))
-            match_table = match_table.withColumnsRenamed({'MappingKey':'ProductKey'})
 
-        elif sbc == 'EOD_METERS':
-            match_table    = match_table.withColumnsRenamed({'MappingKey':'ProductKey'})
-
-        elif sbc == 'TRN':
-            # FLOWCO TRN has no aggregation, but rename MappingKey→ProductKey
-            match_table = match_table.withColumnsRenamed({'MappingKey':'ProductKey'})
-
-        # other FLOWCO subcategories (PMT, LUB, etc) just use the base join results
+        # for FLOWCO METERS, TRN, AR_TRANSACTIONS, etc.—
+        # no further change here; final key-rename happens downstream.
 
         return match_table, mismatch_table
+
         
     def run_lookup(self, stagingTable_firstpro, stagingTable_flowco):
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -806,10 +795,31 @@ class POS_ETL(POS_load_to_fact):
 
         return match_table, mismatch_table
     
-    def rename_mappingKey(self, match_table):
-        if self.SUBCATEGORY in self.mappingkey_rename.keys():
-            match_table = match_table.withColumnsRenamed(self.mappingkey_rename[self.SUBCATEGORY])
-        return match_table
+    def rename_mappingKey(self, df):
+        """
+        Centralized rename of the generic 'MappingKey' (and other columns)
+        into each subcategory's true key names.  Called once, after lookups.
+        """
+        if df is None:
+            return None
+
+        sbc = self.SUBCATEGORY.upper()
+        renames = {
+            # subcategory : { oldName: newName, … }
+            'TRN':             {'MappingKey':'ProductKey'},
+            'EOD_METERS':      {'MappingKey':'ProductKey'},
+            'METERS':          {'MappingKey':'ProductKey'},
+            'EOD_TANKS':       {'MappingKey':'ProductKey'},
+            'TANKS':           {'MappingKey':'ProductKey'},
+            'AR_TRANSACTIONS': {
+                'MappingKey':'GradeKey',
+                'LBAmount':'LubeAmount',
+                'AttendantNumber':'AttendeeNumber'
+            },
+        }
+
+        mapping = renames.get(sbc)
+        return df.withColumnsRenamed(mapping) if mapping else df
 
     def saveMatchTable(self,match_table,path_to_save):
         facttable = spark.read.load(path_to_save)
