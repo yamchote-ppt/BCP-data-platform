@@ -217,6 +217,10 @@ def copySchemaByName(df,fromDf):
     '''
     schemaField can be get by df.schema.fields
     '''
+    print('df schema:')
+    df.printSchema()
+    print('fromDf schema:')
+    fromDf.printSchema()
     dfCol = df.columns
     for column in fromDf.schema.fields:
         if column.name in dfCol: # [] TODO: don't forget to add to other Notebook
