@@ -622,16 +622,6 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
 
 class POS_ETL(POS_load_to_fact):
     def __init__(self,config):
-        MAPPING = {
-            'PMT':            'PAYMENT',
-            'LUB':            'LUBE',
-            'AR_TRANSACTIONS':'AR TRANSACTIONS',
-            'DSC':            'DISCOUNT',
-            'EOD_METERS':     'METERS',
-            'EOD_TANKS':      'TANKS'
-        }
-        # overwrite config in place (or pull out into a local variable)
-        config['SUBCATEGORY'] = MAPPING.get(config['SUBCATEGORY'], config['SUBCATEGORY'])
         super().__init__(config)
 
     def FIRSTPRO(self, stagingTable_firstpro):
