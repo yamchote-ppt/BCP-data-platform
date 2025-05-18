@@ -622,38 +622,66 @@ class POS_load_to_fact(POS): #both main etl and mismatch will use this wherer st
 
 class POS_ETL(POS_load_to_fact):
     def __init__(self,config):
+        MAPPING = {
+            'PMT':            'PAYMENT',
+            'LUB':            'LUBE',
+            'AR_TRANSACTIONS':'AR TRANSACTIONS',
+            'DSC':            'DISCOUNT',
+            'EOD_METERS':     'METERS',
+            'EOD_TANKS':      'TANKS'
+        }
+        # overwrite config in place (or pull out into a local variable)
+        config['SUBCATEGORY'] = MAPPING.get(config['SUBCATEGORY'], config['SUBCATEGORY'])
         super().__init__(config)
 
     def FIRSTPRO(self, stagingTable_firstpro):
         if stagingTable_firstpro.count() == 0:
             return None, None
 
-        # 1) Station lookup
+        sbc = self.SUBCATEGORY.upper()
+
+        # 1) Station lookup (always do this)
         match_sta, unmatch_sta = self.look_up_stationKey(
             stagingTable_firstpro,
-            **self.lookupstation_key[('FIRSTPRO', self.SUBCATEGORY)]
+            **self.lookupstation_key[('FIRSTPRO', sbc)]
         )
 
-        # 2) Product lookup (title + no-title)
-        prod_args    = self.lookupproduct_key.get(('FIRSTPRO', self.SUBCATEGORY), {})
+        # 2) If this is a no‐product subcategory, bypass product lookups entirely
+        if sbc in ['REFUND','POINTS','DISCOUNT','LUBE','PAYMENT']:
+            # PAYMENT needs special date/time columns
+            if sbc == 'PAYMENT':
+                match_table = (
+                    match_sta
+                      .withColumn('PAY_Time', col('PayTimeKey')).drop('PayTimeKey')
+                      .withColumn('END_Time', col('END_TimeKey')).drop('END_TimeKey')
+                )
+                mismatch_table = unmatch_sta
+            else:
+                match_table, mismatch_table = match_sta, unmatch_sta
+
+            return match_table, mismatch_table
+
+        # 3) Otherwise do product lookups
+        prod_args    = self.lookupproduct_key.get(('FIRSTPRO', sbc), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FIRSTPRO',
-            SUBCATEGORY   = self.SUBCATEGORY,
+            SUBCATEGORY   = sbc,
             **prod_args
         )
+
         no_title_args = self.lookupproduct_no_title_key.get(
-            ('FIRSTPRO', self.SUBCATEGORY),
+            ('FIRSTPRO', sbc),
             {'SourceKey_key': None, 'StationKey_key': None}
         )
         match_no, unmatch_no = self.look_up_product_no_title(
             incomingDF    = match_prod,
             CATEGORY      = 'FIRSTPRO',
-            SUBCATEGORY   = self.SUBCATEGORY,
+            SUBCATEGORY   = sbc,
             **no_title_args
         )
 
-        # 3) Assemble match + mismatch
+        # 4) Assemble match + mismatch
         match_table    = match_no
         mismatch_table = unmatch_sta
         if unmatch_prod:
@@ -661,27 +689,9 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_no:
             mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
 
-        # 4) Per-subcategory tweaks (EXCEPT the key-column renames)
-        sbc = self.SUBCATEGORY.upper()
-
-        if sbc == 'PMT':  # PAYMENT
-            match_table    = (
-                match_sta
-                  .withColumn('PAY_Time', col('PayTimeKey')).drop('PayTimeKey')
-                  .withColumn('END_Time', col('END_TimeKey')).drop('END_TimeKey')
-            )
-            mismatch_table = unmatch_sta
-
-        elif sbc in ['REFUND', 'POINTS', 'DISCOUNT', 'LUBE']:
-            match_table, mismatch_table = match_sta, unmatch_sta
-
-        elif sbc == 'FREE':
-            # inject DeliveryId=NULL on both sides
-            match_table    = match_sta   .withColumn('DeliveryId', lit(None).cast(IntegerType()))
-            mismatch_table = unmatch_sta.withColumn('DeliveryId', lit(None).cast(IntegerType()))
-
-        elif sbc == 'TRN':
-            # for FIRSTPRO TRN also aggregate positive volumes + add Vat=NULL
+        # 5) Subcategory‐specific tweaks (excluding key renames)
+        if sbc == 'TRN':
+            # keep only Volume>=0 rows, then sum per transaction + Vat=NULL
             m1 = match_table.filter(col('Volume') >= 0).drop('Volume','Amount')
             m2 = (
                 match_table.groupBy('CloseDateKey','TransNumber','FileKey')
@@ -694,22 +704,16 @@ class POS_ETL(POS_load_to_fact):
             match_table = m1.join(m2, ['CloseDateKey','TransNumber','FileKey'], 'inner')
             match_table = match_table.withColumn('Vat', lit(None))
 
-        elif sbc == 'EOD_METERS':
-            # no further transformation here; key-rename happens downstream
-            pass
-
-        elif sbc == 'AR_TRANSACTIONS':
-            # no further transformation here; key-rename happens downstream
-            pass
-
         elif sbc == 'EOD_TANKS':
-            # FIRSTPRO EOD_TANKS: remove “all-zero” tank records from mismatches
+            # remove “all-zero” tanks from mismatches
             mismatch_table = mismatch_table.filter(~(
-                (col('GradeNumber') == 2)
-             &  (col('OpenVolume') == 0)
-             &  (col('CloseVolume') == 0)
-             &  (col('DeliveryVolume') == 0)
+                (col('GradeNumber') == 2) &
+                (col('OpenVolume') == 0) &
+                (col('CloseVolume') == 0) &
+                (col('DeliveryVolume') == 0)
             ))
+
+        # EOD_METERS, AR_TRANSACTIONS, etc. have no extra FIRSTPRO‐only tweaks here
 
         return match_table, mismatch_table
 
@@ -718,32 +722,47 @@ class POS_ETL(POS_load_to_fact):
         if stagingTable_flowco.count() == 0:
             return None, None
 
+        sbc = self.SUBCATEGORY.upper()
+
         # 1) Station lookup
         match_sta, unmatch_sta = self.look_up_stationKey(
             stagingTable_flowco,
-            **self.lookupstation_key[('FLOWCO', self.SUBCATEGORY)]
+            **self.lookupstation_key[('FLOWCO', sbc)]
         )
 
-        # 2) Product lookup (title + no-title)
-        prod_args    = self.lookupproduct_key.get(('FLOWCO', self.SUBCATEGORY), {})
+        # 2) No‐product branch for FLOWCO
+        if sbc in ['REFUND','POINTS','DISCOUNT','LUBE','PAYMENT']:
+            # FLOWCO PAYMENT: inject null date/time
+            if sbc == 'PAYMENT':
+                nulls = [lit(None).alias(c) for c in ['PAY_Date','PAY_Time','END_Date','END_Time']]
+                match_table    = match_sta.select('*', *nulls)
+                mismatch_table = unmatch_sta.select('*', *nulls)
+            else:
+                match_table, mismatch_table = match_sta, unmatch_sta
+
+            return match_table, mismatch_table
+
+        # 3) Product lookups
+        prod_args    = self.lookupproduct_key.get(('FLOWCO', sbc), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FLOWCO',
-            SUBCATEGORY   = self.SUBCATEGORY,
+            SUBCATEGORY   = sbc,
             **prod_args
         )
+
         no_title_args = self.lookupproduct_no_title_key.get(
-            ('FLOWCO', self.SUBCATEGORY),
+            ('FLOWCO', sbc),
             {'SourceKey_key': None, 'StationKey_key': None}
         )
         match_no, unmatch_no = self.look_up_product_no_title(
             incomingDF    = match_prod,
             CATEGORY      = 'FLOWCO',
-            SUBCATEGORY   = self.SUBCATEGORY,
+            SUBCATEGORY   = sbc,
             **no_title_args
         )
 
-        # 3) Assemble match + mismatch
+        # 4) Assemble match + mismatch
         match_table    = match_no
         mismatch_table = unmatch_sta
         if unmatch_prod:
@@ -751,19 +770,16 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_no:
             mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
 
-        # 4) Per-subcategory tweaks
-        sbc = self.SUBCATEGORY.upper()
-
+        # 5) FLOWCO‐specific tweaks
         if sbc == 'EOD_TANKS':
             mismatch_table = mismatch_table.filter(~(
-                (col('GradeNumber') == 2)
-             &  (col('OpenVolume') == 0)
-             &  (col('CloseVolume') == 0)
-             &  (col('DeliveryVolume') == 0)
+                (col('GradeNumber') == 2) &
+                (col('OpenVolume') == 0) &
+                (col('CloseVolume') == 0) &
+                (col('DeliveryVolume') == 0)
             ))
 
-        # for FLOWCO METERS, TRN, AR_TRANSACTIONS, etc.—
-        # no further change here; final key-rename happens downstream.
+        # TRN, METERS, AR_TRANSACTIONS, etc. have no extra FLOWCO‐only tweaks
 
         return match_table, mismatch_table
 
@@ -797,15 +813,14 @@ class POS_ETL(POS_load_to_fact):
     
     def rename_mappingKey(self, df):
         """
-        Centralized rename of the generic 'MappingKey' (and other columns)
-        into each subcategory's true key names.  Called once, after lookups.
+        Rename the generic MappingKey (and any other columns) into each
+        subcategory's true key names.  Safe on df=None.
         """
         if df is None:
             return None
 
         sbc = self.SUBCATEGORY.upper()
         renames = {
-            # subcategory : { oldName: newName, … }
             'TRN':             {'MappingKey':'ProductKey'},
             'EOD_METERS':      {'MappingKey':'ProductKey'},
             'METERS':          {'MappingKey':'ProductKey'},
