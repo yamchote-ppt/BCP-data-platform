@@ -18,6 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Dict, Any
 
+
 spark = SparkSession.builder.config("spark.sql.extensions", "delta.sql.DeltaSparkSessionExtensions").config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog").getOrCreate()
 
 current_date_list = [int(x) for x in (datetime.now() + timedelta(hours=7)).strftime('%Y%m%d %H%M%S').split(' ')]
@@ -625,41 +626,40 @@ class POS_ETL(POS_load_to_fact):
         super().__init__(config)
 
     def FIRSTPRO(self, stagingTable_firstpro):
+        sbc = self.SUBCATEGORY.upper()
         if stagingTable_firstpro.count() == 0:
             return None, None
 
-        sbc = self.SUBCATEGORY.upper()
-
-        # 1) Station lookup (always do this)
+        # 1) Station lookup
         match_sta, unmatch_sta = self.look_up_stationKey(
             stagingTable_firstpro,
             **self.lookupstation_key[('FIRSTPRO', sbc)]
         )
 
-        # 2) If this is a no‐product subcategory, bypass product lookups entirely
-        if sbc in ['REFUND','POINTS','DISCOUNT','LUBE','PAYMENT']:
-            # PAYMENT needs special date/time columns
-            if sbc == 'PAYMENT':
+        # 2) No-product bypass
+        if sbc in ['REFUND','POINTS','DISCOUNT','LUB','PMT']:
+            if sbc == 'PMT':
+                # regenerate only the time columns, preserve PAY_Date & End_Date
                 match_table = (
                     match_sta
-                      .withColumn('PAY_Time', col('PayTimeKey')).drop('PayTimeKey')
-                      .withColumn('END_Time', col('END_TimeKey')).drop('END_TimeKey')
+                      .withColumn('PAY_Time', col('PayTimeKey').cast(StringType()))
+                      .drop('PayTimeKey')
+                      .withColumn('End_Time', col('END_TimeKey').cast(StringType()))
+                      .drop('END_TimeKey')
                 )
-                mismatch_table = unmatch_sta
             else:
-                match_table, mismatch_table = match_sta, unmatch_sta
-
+                match_table = match_sta
+            mismatch_table = unmatch_sta
             return match_table, mismatch_table
 
-        # 3) Otherwise do product lookups
-        prod_args    = self.lookupproduct_key.get(('FIRSTPRO', sbc), {})
+        # 3) Product lookups
+        prod_args = self.lookupproduct_key.get(('FIRSTPRO', sbc), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FIRSTPRO',
             SUBCATEGORY   = sbc,
             **prod_args
         )
-
         no_title_args = self.lookupproduct_no_title_key.get(
             ('FIRSTPRO', sbc),
             {'SourceKey_key': None, 'StationKey_key': None}
@@ -677,25 +677,24 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_prod:
             mismatch_table = mismatch_table.unionByName(unmatch_prod, allowMissingColumns=True)
         if unmatch_no:
-            mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
+            mismatch_table = mismatch_table.unionByName(unmatch_no,  allowMissingColumns=True)
 
-        # 5) Subcategory‐specific tweaks (excluding key renames)
+        # 5) FIRSTPRO‐only tweaks
         if sbc == 'TRN':
-            # keep only Volume>=0 rows, then sum per transaction + Vat=NULL
             m1 = match_table.filter(col('Volume') >= 0).drop('Volume','Amount')
             m2 = (
-                match_table.groupBy('CloseDateKey','TransNumber','FileKey')
-                           .agg(
-                             spark_sum('Volume').alias('VOLUME'),
-                             spark_sum('Amount').alias('AMOUNT')
-                           )
-                           .withColumn('VOLUME', col('VOLUME').cast(DecimalType(15,3)))
+                match_table
+                  .groupBy('CloseDateKey','TransNumber','FileKey')
+                  .agg(
+                      sum('Volume').alias('VOLUME'),
+                      sum('Amount').alias('AMOUNT')
+                  )
+                  .withColumn('VOLUME', col('VOLUME').cast(DecimalType(15,3)))
             )
-            match_table = m1.join(m2, ['CloseDateKey','TransNumber','FileKey'], 'inner')
-            match_table = match_table.withColumn('Vat', lit(None))
+            match_table = m1.join(m2, ['CloseDateKey','TransNumber','FileKey'], 'inner') \
+                             .withColumn('Vat', lit(None))
 
         elif sbc == 'EOD_TANKS':
-            # remove “all-zero” tanks from mismatches
             mismatch_table = mismatch_table.filter(~(
                 (col('GradeNumber') == 2) &
                 (col('OpenVolume') == 0) &
@@ -703,16 +702,13 @@ class POS_ETL(POS_load_to_fact):
                 (col('DeliveryVolume') == 0)
             ))
 
-        # EOD_METERS, AR_TRANSACTIONS, etc. have no extra FIRSTPRO‐only tweaks here
-
         return match_table, mismatch_table
 
 
     def FLOWCO(self, stagingTable_flowco):
+        sbc = self.SUBCATEGORY.upper()
         if stagingTable_flowco.count() == 0:
             return None, None
-
-        sbc = self.SUBCATEGORY.upper()
 
         # 1) Station lookup
         match_sta, unmatch_sta = self.look_up_stationKey(
@@ -720,27 +716,38 @@ class POS_ETL(POS_load_to_fact):
             **self.lookupstation_key[('FLOWCO', sbc)]
         )
 
-        # 2) No‐product branch for FLOWCO
-        if sbc in ['REFUND','POINTS','DISCOUNT','LUBE','PAYMENT']:
-            # FLOWCO PAYMENT: inject null date/time
-            if sbc == 'PAYMENT':
-                nulls = [lit(None).alias(c) for c in ['PAY_Date','PAY_Time','END_Date','END_Time']]
-                match_table    = match_sta.select('*', *nulls)
-                mismatch_table = unmatch_sta.select('*', *nulls)
+        # 2) No-product bypass
+        if sbc in ['REFUND','POINTS','DISCOUNT','LUB','PMT']:
+            if sbc == 'PMT':
+                # inject null string columns for date/time
+                null_str = lit(None).cast(StringType())
+                match_table = (
+                    match_sta
+                      .withColumn('PAY_Date',  null_str)
+                      .withColumn('PAY_Time',  null_str)
+                      .withColumn('End_Date',  null_str)
+                      .withColumn('End_Time',  null_str)
+                )
+                mismatch_table = (
+                    unmatch_sta
+                      .withColumn('PAY_Date',  null_str)
+                      .withColumn('PAY_Time',  null_str)
+                      .withColumn('End_Date',  null_str)
+                      .withColumn('End_Time',  null_str)
+                )
             else:
                 match_table, mismatch_table = match_sta, unmatch_sta
 
             return match_table, mismatch_table
 
         # 3) Product lookups
-        prod_args    = self.lookupproduct_key.get(('FLOWCO', sbc), {})
+        prod_args = self.lookupproduct_key.get(('FLOWCO', sbc), {})
         match_prod, unmatch_prod = self.look_up_product(
             incomingDF    = match_sta,
             CATEGORY      = 'FLOWCO',
             SUBCATEGORY   = sbc,
             **prod_args
         )
-
         no_title_args = self.lookupproduct_no_title_key.get(
             ('FLOWCO', sbc),
             {'SourceKey_key': None, 'StationKey_key': None}
@@ -758,9 +765,9 @@ class POS_ETL(POS_load_to_fact):
         if unmatch_prod:
             mismatch_table = mismatch_table.unionByName(unmatch_prod, allowMissingColumns=True)
         if unmatch_no:
-            mismatch_table = mismatch_table.unionByName(unmatch_no, allowMissingColumns=True)
+            mismatch_table = mismatch_table.unionByName(unmatch_no,  allowMissingColumns=True)
 
-        # 5) FLOWCO‐specific tweaks
+        # 5) FLOWCO-only tweaks
         if sbc == 'EOD_TANKS':
             mismatch_table = mismatch_table.filter(~(
                 (col('GradeNumber') == 2) &
@@ -769,10 +776,7 @@ class POS_ETL(POS_load_to_fact):
                 (col('DeliveryVolume') == 0)
             ))
 
-        # TRN, METERS, AR_TRANSACTIONS, etc. have no extra FLOWCO‐only tweaks
-
         return match_table, mismatch_table
-
         
     def run_lookup(self, stagingTable_firstpro, stagingTable_flowco):
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -826,14 +830,41 @@ class POS_ETL(POS_load_to_fact):
         mapping = renames.get(sbc)
         return df.withColumnsRenamed(mapping) if mapping else df
 
-    def saveMatchTable(self,match_table,path_to_save):
+    from pyspark.sql.functions import col
+
+    def saveMatchTable(self, match_table, path_to_save):
+        # 1. Load the existing table to capture its schema
         facttable = spark.read.load(path_to_save)
-        match_table = utils.copySchemaByName(match_table, facttable).select(facttable.columns)
+        target_schema = facttable.schema
+
+        # 2. For each field in the target schema, cast the incoming column
+        for field in target_schema:
+            match_table = match_table.withColumn(
+                field.name,
+                col(field.name).cast(field.dataType)
+            )
+
+        # 3. Re-order/select to exactly the table’s columns
+        match_table = match_table.select([col(f.name) for f in target_schema])
+
+        # 4. Append into Delta, now that types line up
         match_table.write.mode('append').save(path_to_save)
 
+
     def saveMisMatchTable(self, mismatch_table, path_to_save):
-        mismatchtable = spark.read.load(path_to_save)
-        mismatch_table = utils.copySchemaByName(mismatch_table, mismatchtable).select(mismatchtable.columns)
+        # 1. Load the existing table to capture its schema
+        facttable = spark.read.load(path_to_save)
+        target_schema = facttable.schema
+        # 2. For each field in the target schema, cast the incoming column  
+        for field in target_schema:
+            mismatch_table = mismatch_table.withColumn(
+                field.name,
+                col(field.name).cast(field.dataType)
+            )
+        # 3. Re-order/select to exactly the table’s columns
+        mismatch_table = mismatch_table.select([col(f.name) for f in target_schema])
+        
+        # 4. Append into Delta, now that types line up  
         mismatch_table.write.mode('append').save(path_to_save)
 
     def remove_previous_data(self, comingFileName):
